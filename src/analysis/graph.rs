@@ -88,6 +88,27 @@ pub enum GraphDiagnostic {
         /// The parse error message.
         reason: String,
     },
+    /// A declared ingress pattern has no observed publisher
+    /// (no `Publish` call site in code overlaps with the declared
+    /// pattern). Either the config is stale or the publisher hasn't
+    /// been wired yet — manual review needed.
+    OrphanIngress {
+        /// Ingress display name (e.g. `"Binance WebSocket"`).
+        ingress_name: String,
+        /// The declared pattern that found no overlap with any
+        /// observed publisher.
+        pattern: String,
+    },
+    /// A declared egress pattern has no observed consumer
+    /// (no `Subscribe` call site in code overlaps with the
+    /// declared `triggered_by` pattern). Stale config or
+    /// not-yet-wired sink.
+    OrphanEgress {
+        /// Egress display name.
+        egress_name: String,
+        /// The declared trigger pattern that found no overlap.
+        pattern: String,
+    },
 }
 
 impl std::fmt::Display for GraphDiagnostic {
@@ -114,6 +135,20 @@ impl std::fmt::Display for GraphDiagnostic {
                 raw,
                 reason,
             } => write!(f, "malformed subject from {origin}: {raw:?} ({reason})"),
+            Self::OrphanIngress {
+                ingress_name,
+                pattern,
+            } => write!(
+                f,
+                "orphan ingress {ingress_name:?}: declared pattern {pattern:?} has no observed consumer in code (data flows in but nothing subscribes)"
+            ),
+            Self::OrphanEgress {
+                egress_name,
+                pattern,
+            } => write!(
+                f,
+                "orphan egress {egress_name:?}: declared trigger pattern {pattern:?} has no observed publisher in code (sink declared but nothing fires)"
+            ),
         }
     }
 }
@@ -133,6 +168,7 @@ pub fn build_graph(inputs: &GraphInputs, index: &SymbolIndex) -> (Graph, Vec<Gra
         collect_node_sets(&resolved, inputs, &mut diagnostics);
     let mut edges = collect_edges(&resolved, inputs);
     add_matches_edges(&mut edges, &resolved, inputs);
+    detect_orphan_ingress_egress(&resolved, inputs, &mut diagnostics);
     let nodes = materialise_nodes(&services, &subjects, &ingress_names, &egress_names);
     let edge_list = materialise_edges(edges, &services, &subjects, &ingress_names, &egress_names);
     (
@@ -503,6 +539,68 @@ fn canonical_pair<'a>(
         (a, b)
     } else {
         (b, a)
+    }
+}
+
+/// Emit `OrphanIngress` / `OrphanEgress` diagnostics for declared
+/// patterns that no in-code call site can serve.
+///
+/// **Semantics** (per the flow direction encoded by `EdgeKind`):
+/// - **Ingress** = external source publishes data **into** the
+///   system. For the data to be useful, some Rust service must
+///   *consume* (subscribe to) the declared subject. Orphan when no
+///   observed **consumer** overlaps — data flows in unread.
+/// - **Egress** = external sink consumes data **out of** the
+///   system. For the sink to fire, some Rust service must
+///   *publish* to the declared subject. Orphan when no observed
+///   **publisher** overlaps — declared sink never receives anything.
+///
+/// **Why `overlaps` and not `covers`:** if config declares
+/// `foo.*.baz` and code subscribes `foo.bar.*`, neither covers the
+/// other but they share `foo.bar.baz` at runtime — so the declared
+/// pattern is *partially* served, not orphaned. The strict
+/// `observed.covers(declared)` check would over-report. v0.1 uses
+/// `overlaps` (lenient); v0.2 can add a `--strict-orphans` flag for
+/// the partial-coverage case if user reports justify it.
+fn detect_orphan_ingress_egress(
+    resolved: &[ResolvedSite],
+    inputs: &GraphInputs,
+    diagnostics: &mut Vec<GraphDiagnostic>,
+) {
+    let observed_publishers: BTreeSet<NatsPattern> = resolved
+        .iter()
+        .filter(|s| matches!(s.kind, CallKind::Publish))
+        .map(|s| s.subject.clone())
+        .collect();
+    let observed_consumers: BTreeSet<NatsPattern> = resolved
+        .iter()
+        .filter(|s| matches!(s.kind, CallKind::Subscribe))
+        .map(|s| s.subject.clone())
+        .collect();
+
+    for ing in &inputs.ingress {
+        for raw in &ing.into {
+            let declared = parse_subject_silent(raw);
+            let has_overlap = observed_consumers.iter().any(|c| c.overlaps(&declared));
+            if !has_overlap {
+                diagnostics.push(GraphDiagnostic::OrphanIngress {
+                    ingress_name: ing.name.clone(),
+                    pattern: declared.as_str().to_string(),
+                });
+            }
+        }
+    }
+    for eg in &inputs.egress {
+        for raw in &eg.triggered_by {
+            let declared = parse_subject_silent(raw);
+            let has_overlap = observed_publishers.iter().any(|p| p.overlaps(&declared));
+            if !has_overlap {
+                diagnostics.push(GraphDiagnostic::OrphanEgress {
+                    egress_name: eg.name.clone(),
+                    pattern: declared.as_str().to_string(),
+                });
+            }
+        }
     }
 }
 
@@ -1022,6 +1120,165 @@ mod tests {
         };
         let (g, _) = build_graph(&inputs, &SymbolIndex::new());
         assert_eq!(count_matches(&g), 1);
+    }
+
+    // ---- P2: orphan ingress/egress detection ----
+
+    fn orphan_ingress_diags(g_diags: &[GraphDiagnostic]) -> Vec<(&str, &str)> {
+        g_diags
+            .iter()
+            .filter_map(|d| match d {
+                GraphDiagnostic::OrphanIngress {
+                    ingress_name,
+                    pattern,
+                } => Some((ingress_name.as_str(), pattern.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+    fn orphan_egress_diags(g_diags: &[GraphDiagnostic]) -> Vec<(&str, &str)> {
+        g_diags
+            .iter()
+            .filter_map(|d| match d {
+                GraphDiagnostic::OrphanEgress {
+                    egress_name,
+                    pattern,
+                } => Some((egress_name.as_str(), pattern.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn orphan_ingress_flagged_when_no_consumer_overlaps() {
+        // Ingress declares `foo.bar`; no service subscribes to
+        // anything overlapping → orphan (data flows in unread).
+        let inputs = GraphInputs {
+            ingress: vec![Ingress {
+                name: "EXT".into(),
+                into: vec!["foo.bar".into()],
+                crate_name: None,
+            }],
+            ..Default::default()
+        };
+        let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(orphan_ingress_diags(&diags), vec![("EXT", "foo.bar")]);
+    }
+
+    #[test]
+    fn orphan_ingress_quiet_when_consumer_overlaps() {
+        // Ingress `foo.bar` + service subscribes `foo.*` → overlap
+        // → not orphan (something reads the ingressed data).
+        let inputs = GraphInputs {
+            call_sites: vec![sub_site("svc", "foo.*")],
+            ingress: vec![Ingress {
+                name: "EXT".into(),
+                into: vec!["foo.bar".into()],
+                crate_name: None,
+            }],
+            ..Default::default()
+        };
+        let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert!(orphan_ingress_diags(&diags).is_empty());
+    }
+
+    #[test]
+    fn orphan_ingress_quiet_on_star_cross_overlap() {
+        // Declared `foo.bar.*`, observed consumer `foo.*.baz`.
+        // Neither covers the other but they overlap on `foo.bar.baz`
+        // — partially served, so v0.1 considers it NOT orphan
+        // (lenient `overlaps` rule). A future --strict-orphans would
+        // flip this.
+        let inputs = GraphInputs {
+            call_sites: vec![sub_site("svc", "foo.*.baz")],
+            ingress: vec![Ingress {
+                name: "EXT".into(),
+                into: vec!["foo.bar.*".into()],
+                crate_name: None,
+            }],
+            ..Default::default()
+        };
+        let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert!(orphan_ingress_diags(&diags).is_empty());
+    }
+
+    #[test]
+    fn orphan_ingress_publisher_only_is_still_orphan() {
+        // Ingress feeds `foo.bar`; the *only* matching code is a
+        // publisher (`foo.*`). External source's data still flows
+        // into a subject nobody subscribes to → orphan ingress.
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("svc", "foo.*")],
+            ingress: vec![Ingress {
+                name: "EXT".into(),
+                into: vec!["foo.bar".into()],
+                crate_name: None,
+            }],
+            ..Default::default()
+        };
+        let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(orphan_ingress_diags(&diags), vec![("EXT", "foo.bar")]);
+    }
+
+    #[test]
+    fn orphan_egress_flagged_when_no_publisher_overlaps() {
+        // Egress sink expects `unrelated.subject` published. The
+        // only call site is a subscribe — nothing publishes →
+        // orphan egress (sink never fires).
+        let inputs = GraphInputs {
+            call_sites: vec![sub_site("svc", "foo.bar")],
+            egress: vec![Egress {
+                name: "SINK".into(),
+                from_crate: "svc".into(),
+                triggered_by: vec!["unrelated.subject".into()],
+            }],
+            ..Default::default()
+        };
+        let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(
+            orphan_egress_diags(&diags),
+            vec![("SINK", "unrelated.subject")]
+        );
+    }
+
+    #[test]
+    fn orphan_egress_quiet_when_publisher_overlaps() {
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("svc", "foo.bar")],
+            egress: vec![Egress {
+                name: "SINK".into(),
+                from_crate: "svc".into(),
+                triggered_by: vec!["foo.*".into()],
+            }],
+            ..Default::default()
+        };
+        let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert!(orphan_egress_diags(&diags).is_empty());
+    }
+
+    #[test]
+    fn orphan_diagnostics_byte_stable_across_runs() {
+        let inputs = GraphInputs {
+            ingress: vec![
+                Ingress {
+                    name: "A".into(),
+                    into: vec!["a.x".into(), "a.y".into()],
+                    crate_name: None,
+                },
+                Ingress {
+                    name: "B".into(),
+                    into: vec!["b.z".into()],
+                    crate_name: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let index = SymbolIndex::new();
+        let (_, d1) = build_graph(&inputs, &index);
+        let (_, d2) = build_graph(&inputs, &index);
+        let s1: Vec<String> = d1.iter().map(GraphDiagnostic::to_string).collect();
+        let s2: Vec<String> = d2.iter().map(GraphDiagnostic::to_string).collect();
+        assert_eq!(s1, s2);
     }
 
     #[test]
