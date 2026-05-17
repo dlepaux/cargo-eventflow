@@ -22,20 +22,23 @@ use syn::{Expr, ExprCall, ExprMethodCall, ImplItem, Item, ItemConst, ItemFn, Ite
 use super::symbol_index::{ExprSnippet, FqPath, PerFileSymbols, Span, Symbol};
 
 /// How loosely we match method names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 pub enum MethodMatch {
     /// Match by method name only. False-positive prone; use for
     /// rare cases where trait imports are obscured by re-exports.
+    #[serde(rename = "name")]
     Name,
     /// Method name + a matching `use` statement somewhere in the
     /// file. **Default per synthesis §H1.** Without this, Gordon
     /// emits 195 false positives against 11 ground-truth sites.
     #[default]
+    #[serde(rename = "name+trait_path_hint")]
     NameTraitPathHint,
 }
 
 /// Trait vs inherent method scoping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PublisherKind {
     /// Trait method: receiver is `&self` (implicitly typed).
     /// Match via trait `use` statement.
@@ -45,38 +48,50 @@ pub enum PublisherKind {
     Inherent,
 }
 
+fn default_subject_arg_index() -> usize {
+    0
+}
+
 /// Configured publish call shape.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct PublisherSpec {
     /// Trait or inherent scoping.
     pub kind: PublisherKind,
     /// Trait path (for `Trait` kind): e.g. `"my_bus::Publisher"`.
+    #[serde(default)]
     pub path: Option<String>,
     /// Type path (for `Inherent` kind): e.g.
-    /// `"my_bus::nats::NatsPublisher"`.
+    /// `"my_bus::nats::NatsPublisher"`. Renamed to `type` in TOML
+    /// to keep the config keys terse.
+    #[serde(default, rename = "type")]
     pub type_path: Option<String>,
     /// Method name: e.g. `"publish"`, `"publish_within"`.
     pub method: String,
     /// 0-based index of the subject argument
     /// (after the receiver). Default 0; inherent outbox
     /// methods taking `&mut Tx` first use 1.
+    #[serde(default = "default_subject_arg_index")]
     pub subject_arg_index: usize,
 }
 
 /// Configured subscribe call shape.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct ConsumerSpec {
     /// Trait or inherent scoping.
     pub kind: PublisherKind,
     /// Trait path (for `Trait` kind).
+    #[serde(default)]
     pub path: Option<String>,
     /// Type path (for `Inherent` kind).
+    #[serde(default, rename = "type")]
     pub type_path: Option<String>,
     /// Method name: e.g. `"subscribe"`.
     pub method: String,
     /// 0-based index of the subject argument.
+    #[serde(default = "default_subject_arg_index")]
     pub subject_arg_index: usize,
     /// Optional 0-based index of the consumer-name argument.
+    #[serde(default)]
     pub consumer_name_arg_index: Option<usize>,
 }
 

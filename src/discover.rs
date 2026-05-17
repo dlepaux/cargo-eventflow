@@ -96,17 +96,22 @@ impl Workspace {
 /// full [`crate::config::Config`] wraps this plus the bus +
 /// subject + output sections. Kept minimal here so unit tests can
 /// drive `discover` without a TOML round-trip.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoverConfig {
     /// Glob patterns matching service crate names.
     /// Empty = match every member (default).
+    #[serde(default)]
     pub services: Vec<String>,
     /// Glob patterns matching library crate names.
+    #[serde(default)]
     pub libraries: Vec<String>,
     /// Glob patterns matching crates to skip.
+    #[serde(default)]
     pub ignore: Vec<String>,
     /// Include `tests/`, `examples/`, `benches/` in walked
     /// source files. Off by default.
+    #[serde(default)]
     pub include_test_files: bool,
 }
 

@@ -11,18 +11,19 @@ use super::subject::{ResolveOutcome, Scope};
 use super::symbol_index::SymbolIndex;
 
 /// One declared ingress (data source feeding the system).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Ingress {
     /// Display name (e.g. "Binance WebSocket").
     pub name: String,
     /// Subject patterns this source feeds.
     pub into: Vec<String>,
     /// Owning service crate (for layout grouping).
+    #[serde(default, rename = "crate")]
     pub crate_name: Option<String>,
 }
 
 /// One declared egress (data sink fed by the system).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Egress {
     /// Display name (e.g. "Binance REST").
     pub name: String,
