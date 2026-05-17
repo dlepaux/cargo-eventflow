@@ -165,7 +165,7 @@ pub fn discover(manifest_path: &Path, config: &DiscoverConfig) -> Result<Workspa
         let source_files = enumerate_source_files(&crate_path, config.include_test_files)?;
 
         members.push(CrateInfo {
-            name: pkg.name.clone(),
+            name: pkg.name.to_string(),
             path: crate_path,
             kind,
             source_files,
