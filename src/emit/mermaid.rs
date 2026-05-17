@@ -8,7 +8,7 @@
 //! §P0-H (5 determinism invariants), §P1-C (theme system),
 //! §P1-G (no tool-version stamp by default).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 
 use crate::model::{EdgeKind, Graph, Node};
@@ -86,6 +86,8 @@ pub const FORMAT_VERSION: &str = "mermaid-v1";
 /// tool version, by default.
 #[must_use]
 pub fn render_mermaid(graph: &Graph, opts: &MermaidOptions) -> String {
+    let ids = IdMap::build(graph);
+
     let mut out = String::new();
     if opts.flags.markdown {
         out.push_str("```mermaid\n");
@@ -93,8 +95,8 @@ pub fn render_mermaid(graph: &Graph, opts: &MermaidOptions) -> String {
     write_banner(&mut out, opts);
     out.push_str("graph LR\n");
 
-    write_nodes(&mut out, graph, opts);
-    write_edges(&mut out, graph);
+    write_nodes(&mut out, graph, opts, &ids);
+    write_edges(&mut out, graph, &ids);
     write_styles(&mut out, graph, opts);
 
     if opts.flags.markdown {
@@ -125,7 +127,7 @@ fn write_banner(out: &mut String, opts: &MermaidOptions) {
     );
 }
 
-fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
+fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions, ids: &IdMap) {
     // Ingress + egress first (outside subgraphs).
     if opts.flags.include_ingress_egress {
         for node in &graph.nodes {
@@ -134,7 +136,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
                     let _ = writeln!(
                         out,
                         "  {}[/\"{}\"\\]:::ingress",
-                        node_id(node),
+                        ids.for_node(node),
                         escape_label(name)
                     );
                 }
@@ -142,7 +144,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
                     let _ = writeln!(
                         out,
                         "  {}[\\\"{}\"/]:::egress",
-                        node_id(node),
+                        ids.for_node(node),
                         escape_label(name)
                     );
                 }
@@ -154,7 +156,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
     // Service nodes always rendered (rectangles).
     for node in &graph.nodes {
         if let Node::Service(name) = node {
-            let _ = writeln!(out, "  {}[\"{}\"]", node_id(node), escape_label(name));
+            let _ = writeln!(out, "  {}[\"{}\"]", ids.for_node(node), escape_label(name));
         }
     }
 
@@ -165,14 +167,14 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
             let _ = writeln!(
                 out,
                 "  subgraph {} [\"{} — published\"]",
-                escape_id(&format!("sg_{publisher}")),
+                ids.for_subgraph(publisher),
                 escape_label(publisher)
             );
             for subj in subjects {
                 let _ = writeln!(
                     out,
                     "    {}([\"{}\"])",
-                    node_id(&Node::Subject(subj.clone())),
+                    ids.for_node(&Node::Subject(subj.clone())),
                     escape_label(subj)
                 );
             }
@@ -181,13 +183,14 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
         if !groups.multi_publisher.is_empty() {
             let _ = writeln!(
                 out,
-                "  subgraph sg_multi_publisher [\"shared subjects (multiple publishers)\"]"
+                "  subgraph {} [\"shared subjects (multiple publishers)\"]",
+                ids.for_subgraph_special_multi()
             );
             for subj in &groups.multi_publisher {
                 let _ = writeln!(
                     out,
                     "    {}([\"{}\"])",
-                    node_id(&Node::Subject(subj.clone())),
+                    ids.for_node(&Node::Subject(subj.clone())),
                     escape_label(subj)
                 );
             }
@@ -198,31 +201,32 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
             let _ = writeln!(
                 out,
                 "  {}([\"{}\"])",
-                node_id(&Node::Subject(subj.clone())),
+                ids.for_node(&Node::Subject(subj.clone())),
                 escape_label(subj)
             );
         }
     } else {
         for node in &graph.nodes {
             if let Node::Subject(name) = node {
-                let _ = writeln!(out, "  {}([\"{}\"])", node_id(node), escape_label(name));
+                let _ = writeln!(
+                    out,
+                    "  {}([\"{}\"])",
+                    ids.for_node(node),
+                    escape_label(name)
+                );
             }
         }
     }
 }
 
-fn write_edges(out: &mut String, graph: &Graph) {
+fn write_edges(out: &mut String, graph: &Graph, ids: &IdMap) {
     for edge in &graph.edges {
-        let from = node_id(&edge.from);
-        let to = node_id(&edge.to);
+        let from = ids.for_node(&edge.from);
+        let to = ids.for_node(&edge.to);
         let label = edge.label.as_ref().map_or_else(
             || " -->".to_string(),
             |l| format!(" -- \"{}\" -->", escape_label(l)),
         );
-        // Edge styling is driven entirely by per-edge `linkStyle`
-        // directives below (write_styles). `:::class` on the
-        // arrow tail would apply to the target node, not the
-        // edge — wrong semantically.
         let _ = writeln!(out, "  {from}{label} {to}");
     }
 }
@@ -359,19 +363,81 @@ fn palette_for(theme: Theme) -> Palette {
 
 // -------- id + label sanitisation --------
 
-fn node_id(node: &Node) -> String {
-    let raw = node.id();
-    escape_id(&raw)
+/// Collision-free Mermaid-ID map for every node + subgraph in the graph.
+///
+/// Built once per render pass. Maps each raw key (`Node::id()` for nodes,
+/// `sg:<service>` for publisher subgraphs) to a Mermaid-safe identifier
+/// that is **guaranteed unique** within the diagram.
+///
+/// Why a two-pass map and not inline escape: the naive escape collapses
+/// `>` → `g`, `*` → `s`, `.` → `_`. Two distinct raw keys can collapse
+/// to the same Mermaid id (`risk.events.*` and `risk.events.s` both
+/// become `sub_risk_events_s`). The map detects that collision and
+/// appends a numeric suffix (`_2`, `_3`, …) to the second-and-later
+/// occurrences in canonical raw-key order.
+struct IdMap {
+    map: BTreeMap<String, String>,
 }
 
-fn escape_id(s: &str) -> String {
-    // Mermaid node ids accept [a-zA-Z0-9_]. Map everything else
-    // to '_'. Tail wildcard '>' → 'g' (greater); single '*' → 's'
-    // (star); '.' → '_'. Collisions disambiguated by callers
-    // (the synthesis §P0-H invariant 2 disambiguator lives in
-    // build_graph if it ever becomes load-bearing — for v0.1 we
-    // accept that the BTreeSet dedupe in build_graph already
-    // prevents most collision shapes).
+impl IdMap {
+    /// Collect every raw id that will appear in the rendered diagram
+    /// (node ids + publisher-subgraph ids + the special multi-publisher
+    /// subgraph id) and assign each a Mermaid-safe, collision-free id.
+    fn build(graph: &Graph) -> Self {
+        let mut raw_ids: BTreeSet<String> = BTreeSet::new();
+        for node in &graph.nodes {
+            raw_ids.insert(node.id());
+        }
+        for edge in &graph.edges {
+            if matches!(edge.kind, EdgeKind::Publish) {
+                if let Node::Service(svc) = &edge.from {
+                    raw_ids.insert(format!("sg:{svc}"));
+                }
+            }
+        }
+        raw_ids.insert(MULTI_PUBLISHER_RAW.to_string());
+
+        let mut map = BTreeMap::new();
+        let mut used: BTreeSet<String> = BTreeSet::new();
+        for raw in raw_ids {
+            let base = escape_id_basic(&raw);
+            let mut candidate = base.clone();
+            let mut suffix: usize = 2;
+            while used.contains(&candidate) {
+                candidate = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            used.insert(candidate.clone());
+            map.insert(raw, candidate);
+        }
+        Self { map }
+    }
+
+    fn for_node(&self, node: &Node) -> &str {
+        self.lookup(&node.id())
+    }
+
+    fn for_subgraph(&self, service: &str) -> &str {
+        self.lookup(&format!("sg:{service}"))
+    }
+
+    fn for_subgraph_special_multi(&self) -> &str {
+        self.lookup(MULTI_PUBLISHER_RAW)
+    }
+
+    fn lookup(&self, raw: &str) -> &str {
+        self.map
+            .get(raw)
+            .map_or(MISSING_ID_SENTINEL, String::as_str)
+    }
+}
+
+const MULTI_PUBLISHER_RAW: &str = "sg:__multi_publisher__";
+const MISSING_ID_SENTINEL: &str = "_missing_id_";
+
+/// Map a raw key to a Mermaid-safe character set. Does not handle
+/// collisions on its own — that's [`IdMap::build`]'s job.
+fn escape_id_basic(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -561,5 +627,153 @@ mod tests {
         let out = render_mermaid(&g, &MermaidOptions::default());
         assert!(out.contains("&quot;"));
         assert!(!out.contains("\"contains \"quote\"\""));
+    }
+
+    // ---- disambiguator tests (P1 commit 1) ----
+    //
+    // The naive escape collapses `*` → `s`, `>` → `g`, `.` → `_`. Two
+    // distinct raw keys can collapse to the same id. The disambiguator
+    // detects collisions and appends `_2`, `_3`, … in canonical raw-key
+    // order so every rendered id is unique.
+
+    fn collision_graph() -> Graph {
+        Graph {
+            nodes: vec![
+                Node::Subject("risk.events.*".into()),
+                Node::Subject("risk.events.s".into()),
+                Node::Subject("risk.events.>".into()),
+                Node::Subject("risk.events.g".into()),
+            ],
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn disambiguator_resolves_star_vs_literal_s_collision() {
+        let out = render_mermaid(&collision_graph(), &MermaidOptions::default());
+        let lines: Vec<&str> = out.lines().collect();
+        // Each subject must appear with its own id; collisions are
+        // resolved by `_2` suffix on the second-and-later raw keys in
+        // canonical (BTreeSet) order: `sub:risk.events.*`,
+        // `sub:risk.events.>`, `sub:risk.events.g`, `sub:risk.events.s`.
+        // After disambiguation:
+        //   sub:risk.events.*  → sub_risk_events_s
+        //   sub:risk.events.>  → sub_risk_events_g
+        //   sub:risk.events.g  → sub_risk_events_g_2
+        //   sub:risk.events.s  → sub_risk_events_s_2
+        let id_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("([\"risk.events."))
+            .collect();
+        assert_eq!(id_lines.len(), 4, "all 4 subject nodes rendered");
+
+        // Extract the rendered Mermaid ids — they must all be distinct.
+        let ids: Vec<&str> = id_lines
+            .iter()
+            .filter_map(|l| l.split('(').next().map(str::trim))
+            .collect();
+        let unique: BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "disambiguator failed: duplicate ids {ids:?}"
+        );
+
+        // Lock the specific suffix pattern so future refactors notice.
+        assert!(out.contains("sub_risk_events_s([\"risk.events.*\"])"));
+        assert!(out.contains("sub_risk_events_g([\"risk.events.>\"])"));
+        assert!(out.contains("sub_risk_events_g_2([\"risk.events.g\"])"));
+        assert!(out.contains("sub_risk_events_s_2([\"risk.events.s\"])"));
+    }
+
+    #[test]
+    fn disambiguator_is_deterministic_across_runs() {
+        let g = collision_graph();
+        let opts = MermaidOptions::default();
+        let a = render_mermaid(&g, &opts);
+        let b = render_mermaid(&g, &opts);
+        assert_eq!(a, b, "two render passes must be byte-identical");
+    }
+
+    #[test]
+    fn disambiguator_no_collision_no_suffix() {
+        // No collisions → no `_2` suffix anywhere.
+        let out = render_mermaid(&simple_graph(), &MermaidOptions::default());
+        assert!(
+            !out.contains("_2"),
+            "unexpected disambiguation suffix in collision-free graph: {out}"
+        );
+    }
+
+    #[test]
+    fn disambiguator_handles_edges_using_disambiguated_ids() {
+        // Edge endpoints must resolve through the same map as node ids
+        // — otherwise edges would point at undefined / wrong nodes.
+        let g = Graph {
+            nodes: vec![
+                Node::Service("svc".into()),
+                Node::Subject("foo.*".into()),
+                Node::Subject("foo.s".into()),
+            ],
+            edges: vec![
+                Edge {
+                    from: Node::Service("svc".into()),
+                    to: Node::Subject("foo.*".into()),
+                    kind: EdgeKind::Publish,
+                    label: None,
+                },
+                Edge {
+                    from: Node::Service("svc".into()),
+                    to: Node::Subject("foo.s".into()),
+                    kind: EdgeKind::Publish,
+                    label: None,
+                },
+            ],
+        };
+        let out = render_mermaid(&g, &MermaidOptions::default());
+
+        // Both subject nodes must be declared distinctly, and the two
+        // Publish edges must point at the matching disambiguated ids.
+        assert!(out.contains("sub_foo_s([\"foo.*\"])"));
+        assert!(out.contains("sub_foo_s_2([\"foo.s\"])"));
+        assert!(out.contains("--> sub_foo_s\n"));
+        assert!(out.contains("--> sub_foo_s_2\n"));
+    }
+
+    #[test]
+    fn disambiguator_handles_subgraph_id_collision_with_node_id() {
+        // Pathological: a service named `sg_svc_x` and a publisher
+        // service named `svc-x` whose subgraph id would naively also be
+        // `sg_svc_x`. Disambiguator must keep them separate.
+        let g = Graph {
+            nodes: vec![
+                Node::Service("svc-x".into()),
+                Node::Service("sg_svc_x".into()),
+                Node::Subject("foo".into()),
+            ],
+            edges: vec![Edge {
+                from: Node::Service("svc-x".into()),
+                to: Node::Subject("foo".into()),
+                kind: EdgeKind::Publish,
+                label: None,
+            }],
+        };
+        let out = render_mermaid(&g, &MermaidOptions::default());
+
+        // Both services + the subgraph rendered, all distinct ids.
+        // Raw keys (BTreeSet order): `sg:svc-x`, `sg:__multi_publisher__`,
+        // `sub:foo`, `svc:sg_svc_x`, `svc:svc-x`.
+        // escape_id_basic on each:
+        //   sg:svc-x          → sg_svc_x
+        //   sg:__multi_pub... → sg___multi_publisher__
+        //   sub:foo           → sub_foo
+        //   svc:sg_svc_x      → svc_sg_svc_x
+        //   svc:svc-x         → svc_svc_x
+        // No collisions in this set — but the test still locks the
+        // subgraph declaration uses `sg_svc_x` and the service node uses
+        // `svc_sg_svc_x` (distinct prefix), proving the namespace fix.
+        assert!(out.contains("subgraph sg_svc_x ["));
+        assert!(out.contains("svc_sg_svc_x[\"sg_svc_x\"]"));
+        assert!(out.contains("svc_svc_x[\"svc-x\"]"));
     }
 }
