@@ -14,7 +14,9 @@
 //! emit. Future versions may expand as editor / LSP integrations
 //! materialize.
 
+pub mod analysis;
 pub mod config;
+pub mod discover;
 pub mod model;
 
 /// Top-level error type returned by [`analyze`].
