@@ -202,6 +202,13 @@ impl SymbolIndex {
         self.by_crate.is_empty()
     }
 
+    /// Iterate over every `(FqPath, Symbol)` pair. Used by the
+    /// resolver to scan for builder methods/functions by suffix
+    /// match. Deterministic via [`BTreeMap`] iteration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Symbol)> {
+        self.by_crate.iter().map(|((_, path), sym)| (path, sym))
+    }
+
     fn find_by_path(&self, path: &str) -> Option<(&str, &Symbol)> {
         self.by_crate.iter().find_map(|((k_crate, k_path), sym)| {
             if k_path == path {

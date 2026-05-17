@@ -122,6 +122,10 @@ pub struct RawCallSite {
     pub consumer_name_expr: Option<String>,
     /// Which configured method matched (for diagnostics).
     pub matched_method: String,
+    /// Source of the enclosing function body, if any. Used by the
+    /// resolver to follow `let subject = ...` bindings. `None`
+    /// when the call site is at module scope.
+    pub enclosing_fn_body: Option<String>,
 }
 
 /// Output of [`extract`]: call sites + symbol-index contributions.
@@ -177,6 +181,7 @@ pub fn extract(
         imports: &imports,
         module_stack: Vec::new(),
         impl_type_stack: Vec::new(),
+        fn_body_stack: Vec::new(),
         sites: Vec::new(),
         symbols: PerFileSymbols {
             crate_name: crate_name.to_string(),
@@ -259,6 +264,7 @@ struct Visitor<'a> {
     imports: &'a [String],
     module_stack: Vec<String>,
     impl_type_stack: Vec<String>,
+    fn_body_stack: Vec<String>,
     sites: Vec<RawCallSite>,
     symbols: PerFileSymbols,
 }
@@ -377,6 +383,7 @@ impl Visitor<'_> {
             subject_expr: expr_to_source(subject_expr),
             consumer_name_expr: None,
             matched_method: spec.method.clone(),
+            enclosing_fn_body: self.fn_body_stack.last().cloned(),
         })
     }
 
@@ -402,6 +409,7 @@ impl Visitor<'_> {
             subject_expr: expr_to_source(subject_expr),
             consumer_name_expr,
             matched_method: spec.method.clone(),
+            enclosing_fn_body: self.fn_body_stack.last().cloned(),
         })
     }
 
@@ -426,6 +434,7 @@ impl Visitor<'_> {
             subject_expr: expr_to_source(subject_expr),
             consumer_name_expr: None,
             matched_method: spec.method.clone(),
+            enclosing_fn_body: self.fn_body_stack.last().cloned(),
         })
     }
 
@@ -451,6 +460,7 @@ impl Visitor<'_> {
             subject_expr: expr_to_source(subject_expr),
             consumer_name_expr,
             matched_method: spec.method.clone(),
+            enclosing_fn_body: self.fn_body_stack.last().cloned(),
         })
     }
 
@@ -508,7 +518,17 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
             }
         }
 
-        syn::visit::visit_item_impl(self, item);
+        // Push impl-method bodies on the fn-body stack so calls
+        // inside them can follow `let X = ...` bindings.
+        for impl_item in &item.items {
+            if let ImplItem::Fn(method) = impl_item {
+                self.fn_body_stack
+                    .push(format!("{}", quote_method_body(method)));
+                syn::visit::visit_impl_item_fn(self, method);
+                self.fn_body_stack.pop();
+            }
+        }
+
         self.impl_type_stack.pop();
     }
 
@@ -538,10 +558,18 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
             column,
         };
         let source = block_to_source(&item.block);
-        self.symbols
-            .symbols
-            .push((fq, Symbol::Function(ExprSnippet { source, span })));
+        self.symbols.symbols.push((
+            fq,
+            Symbol::Function(ExprSnippet {
+                source: source.clone(),
+                span,
+            }),
+        ));
+        // Push fn body so child calls can follow `let X = ...`
+        // bindings via Scope::fn_body_source.
+        self.fn_body_stack.push(source);
         syn::visit::visit_item_fn(self, item);
+        self.fn_body_stack.pop();
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
