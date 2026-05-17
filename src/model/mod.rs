@@ -7,12 +7,22 @@
 
 #![allow(missing_docs)]
 
+pub mod pattern;
+
+pub use pattern::{NatsPattern, ParseError as PatternParseError, Segment};
+
 /// Unique identifier for a service crate.
 pub type ServiceId = String;
 
 /// A resolved NATS subject pattern. Dynamic segments render as
 /// `*` (single segment) or `>` (tail). Unresolvable segments
 /// render as `?`.
+///
+/// Today still a `String` for backwards compat with the analysis
+/// pipeline. P1 commit 3 flips this to [`NatsPattern`] in the same
+/// patch that threads the type through `Node::Subject` and
+/// `collect_node_sets`. This commit (P1 commit 2) ships the algebra
+/// module standalone — no behaviour change here.
 pub type SubjectPattern = String;
 
 /// A node in the event-flow graph.
