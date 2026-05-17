@@ -72,12 +72,27 @@ pub struct Edge {
 }
 
 /// Edge classification — drives Mermaid line styling.
+///
+/// Discriminant values are stable: `Publish = 0`, `Consume = 1`,
+/// `Ingress = 2`, `Egress = 3`, `Matches = 4`. The edge sort
+/// comparator in `analysis::graph::materialise_edges` casts to
+/// `u8` and relies on this ordering — append new variants at the
+/// tail only, never reorder.
+///
+/// `#[non_exhaustive]` so downstream `match` arms must add a
+/// fallback when the enum grows (e.g. a future `json` emit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+#[repr(u8)]
 pub enum EdgeKind {
-    Publish,
-    Consume,
-    Ingress,
-    Egress,
+    Publish = 0,
+    Consume = 1,
+    Ingress = 2,
+    Egress = 3,
+    /// Symmetric overlap between two subject patterns: at least one
+    /// concrete subject would route to both. Rendered undirected
+    /// (`---`) because the relation has no flow direction.
+    Matches = 4,
 }
 
 /// The full event-flow graph.

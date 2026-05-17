@@ -223,9 +223,17 @@ fn write_edges(out: &mut String, graph: &Graph, ids: &IdMap) {
     for edge in &graph.edges {
         let from = ids.for_node(&edge.from);
         let to = ids.for_node(&edge.to);
+        // `Matches` edges are symmetric (subject ↔ subject pattern
+        // overlap, no flow direction) → render undirected. Every
+        // other kind keeps the directed arrow.
+        let arrow = if matches!(edge.kind, EdgeKind::Matches) {
+            " ---"
+        } else {
+            " -->"
+        };
         let label = edge.label.as_ref().map_or_else(
-            || " -->".to_string(),
-            |l| format!(" -- \"{}\" -->", escape_label(l)),
+            || arrow.to_string(),
+            |l| format!(" -- \"{}\"{arrow}", escape_label(l)),
         );
         let _ = writeln!(out, "  {from}{label} {to}");
     }
@@ -254,9 +262,11 @@ fn write_styles(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
             EdgeKind::Consume => &palette.consume_stroke,
             EdgeKind::Ingress => &palette.ingress_stroke,
             EdgeKind::Egress => &palette.egress_stroke,
+            EdgeKind::Matches => &palette.matches_stroke,
         };
         let extra = match edge.kind {
             EdgeKind::Consume => ",stroke-dasharray:5 5",
+            EdgeKind::Matches => ",stroke-dasharray:2 4,stroke-opacity:0.5",
             _ => "",
         };
         let width = match edge.kind {
@@ -327,6 +337,7 @@ struct Palette {
     consume_stroke: String,
     ingress_stroke: String,
     egress_stroke: String,
+    matches_stroke: String,
     ingress_fill: String,
     egress_fill: String,
 }
@@ -338,6 +349,7 @@ fn palette_for(theme: Theme) -> Palette {
             consume_stroke: "#16a34a".into(),
             ingress_stroke: "#dc2626".into(),
             egress_stroke: "#7c3aed".into(),
+            matches_stroke: "#94a3b8".into(),
             ingress_fill: "#fee2e2".into(),
             egress_fill: "#ede9fe".into(),
         },
@@ -347,6 +359,7 @@ fn palette_for(theme: Theme) -> Palette {
             consume_stroke: "#33a02c".into(),
             ingress_stroke: "#e31a1c".into(),
             egress_stroke: "#ff7f00".into(),
+            matches_stroke: "#6a3d9a".into(),
             ingress_fill: "#fdbf6f".into(),
             egress_fill: "#cab2d6".into(),
         },
@@ -355,6 +368,7 @@ fn palette_for(theme: Theme) -> Palette {
             consume_stroke: "#555".into(),
             ingress_stroke: "#000".into(),
             egress_stroke: "#000".into(),
+            matches_stroke: "#999".into(),
             ingress_fill: "#eee".into(),
             egress_fill: "#eee".into(),
         },

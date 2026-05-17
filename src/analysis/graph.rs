@@ -131,7 +131,8 @@ pub fn build_graph(inputs: &GraphInputs, index: &SymbolIndex) -> (Graph, Vec<Gra
     let resolved = resolve_all(inputs, index, &mut diagnostics);
     let (services, subjects, ingress_names, egress_names) =
         collect_node_sets(&resolved, inputs, &mut diagnostics);
-    let edges = collect_edges(&resolved, inputs);
+    let mut edges = collect_edges(&resolved, inputs);
+    add_matches_edges(&mut edges, &resolved, inputs);
     let nodes = materialise_nodes(&services, &subjects, &ingress_names, &egress_names);
     let edge_list = materialise_edges(edges, &services, &subjects, &ingress_names, &egress_names);
     (
@@ -345,6 +346,164 @@ fn collect_edges(
 fn parse_subject_silent(raw: &str) -> NatsPattern {
     NatsPattern::parse(raw)
         .unwrap_or_else(|_| NatsPattern::parse("?").expect("? is a legal literal token"))
+}
+
+/// Sweep `publisher_subjects × consumer_subjects` for pattern
+/// overlap and emit `EdgeKind::Matches` edges where NATS would route
+/// at least one concrete subject through both endpoints.
+///
+/// Definitions (per [04-challenge-synthesis.md, decision #3]):
+/// - `publisher_subjects` = subjects that appear as the target of a
+///   `Publish` edge **or** as the target of an `Ingress` edge.
+/// - `consumer_subjects` = subjects that appear as the source of a
+///   `Consume` edge **or** as the source of an `Egress` edge.
+///
+/// Edge direction is **canonical**: for each overlapping pair we
+/// store the edge with `(min(id), max(id))` so two iteration orders
+/// produce identical edge sets — required by synthesis §P0-H
+/// invariant 1 (1000-run byte-stability).
+///
+/// Mermaid renders `Matches` as undirected (`---`) because the
+/// relation has no flow direction — see `emit::mermaid::write_edges`.
+///
+/// Optimisation: pre-bucket by head-literal token. Two patterns
+/// whose head literals differ can never overlap unless one of them
+/// starts with `*` or `>` ("wild head"). The wild-head bucket
+/// cross-multiplies against every literal-head bucket; literal-head
+/// buckets compare only within themselves.
+fn add_matches_edges(
+    edges: &mut BTreeMap<EdgeKey, (EdgeKind, Option<String>)>,
+    resolved: &[ResolvedSite],
+    inputs: &GraphInputs,
+) {
+    // All-pairs sweep over the union of every subject that appears
+    // anywhere in the graph. The challenge-synthesis originally
+    // specified `publisher_subjects × consumer_subjects`, but that
+    // shape misses publisher-publisher overlaps (e.g. gordon-data
+    // publishes `market.klines.binance.*.*.*` while the Binance
+    // ingress declares `market.klines.binance.spot.*.1m` — both
+    // publishers, structurally overlapping, audit-worthy). All-pairs
+    // matches challenge-02's hand-counted 8 expected edges on Gordon
+    // and gives a complete view of subject-pattern relationships.
+    let mut all_subjects: BTreeSet<NatsPattern> = BTreeSet::new();
+    for site in resolved {
+        all_subjects.insert(site.subject.clone());
+    }
+    for ing in &inputs.ingress {
+        for s in &ing.into {
+            all_subjects.insert(parse_subject_silent(s));
+        }
+    }
+    for eg in &inputs.egress {
+        for s in &eg.triggered_by {
+            all_subjects.insert(parse_subject_silent(s));
+        }
+    }
+
+    let buckets = head_buckets(&all_subjects);
+    sweep_buckets(&buckets, edges);
+}
+
+/// Head-literal bucketing: `BTreeMap<Option<String>, Vec<&NatsPattern>>`.
+/// The `None` key holds patterns whose first segment is `*` or `>`
+/// ("wild head"); these cross-multiply against every literal bucket.
+fn head_buckets(set: &BTreeSet<NatsPattern>) -> BTreeMap<Option<String>, Vec<&NatsPattern>> {
+    use crate::model::Segment;
+    let mut buckets: BTreeMap<Option<String>, Vec<&NatsPattern>> = BTreeMap::new();
+    for pat in set {
+        let key = match pat.segments().first() {
+            Some(Segment::Literal(head)) => Some(head.clone()),
+            _ => None,
+        };
+        buckets.entry(key).or_default().push(pat);
+    }
+    buckets
+}
+
+fn sweep_buckets(
+    buckets: &BTreeMap<Option<String>, Vec<&NatsPattern>>,
+    edges: &mut BTreeMap<EdgeKey, (EdgeKind, Option<String>)>,
+) {
+    let empty: Vec<&NatsPattern> = Vec::new();
+    let wild = buckets.get(&None).unwrap_or(&empty);
+
+    // Same-head literal buckets: compare each unordered pair within
+    // the bucket once; then cross-multiply each literal bucket
+    // against the wild-head bucket.
+    for (key, members) in buckets {
+        if key.is_none() {
+            continue;
+        }
+        emit_within(members, edges);
+        emit_cross(members, wild, edges);
+    }
+    // Wild × wild internal pairs (e.g. two `*.foo` patterns or `>`
+    // alongside `*.bar` — none on Gordon today, but the algorithm
+    // must handle it).
+    emit_within(wild, edges);
+}
+
+/// Emit Matches edges for every unordered pair within `members`
+/// whose patterns overlap (and are not identical).
+fn emit_within(
+    members: &[&NatsPattern],
+    edges: &mut BTreeMap<EdgeKey, (EdgeKind, Option<String>)>,
+) {
+    for (i, a) in members.iter().enumerate() {
+        for b in &members[i + 1..] {
+            if a == b || !a.overlaps(b) {
+                continue;
+            }
+            insert_matches_edge(a, b, edges);
+        }
+    }
+}
+
+/// Emit Matches edges across two disjoint groups (every member of
+/// `left` against every member of `right`).
+fn emit_cross(
+    left: &[&NatsPattern],
+    right: &[&NatsPattern],
+    edges: &mut BTreeMap<EdgeKey, (EdgeKind, Option<String>)>,
+) {
+    for a in left {
+        for b in right {
+            if a == b || !a.overlaps(b) {
+                continue;
+            }
+            insert_matches_edge(a, b, edges);
+        }
+    }
+}
+
+fn insert_matches_edge(
+    a: &NatsPattern,
+    b: &NatsPattern,
+    edges: &mut BTreeMap<EdgeKey, (EdgeKind, Option<String>)>,
+) {
+    let (lo, hi) = canonical_pair(a, b);
+    edges.insert(
+        EdgeKey {
+            from: Node::Subject(lo.clone()).id(),
+            to: Node::Subject(hi.clone()).id(),
+            kind: EdgeKind::Matches,
+        },
+        (EdgeKind::Matches, None),
+    );
+}
+
+/// Canonical edge direction for symmetric Matches edges: smaller
+/// `Node::id()` first. Ensures `sweep_buckets` produces identical
+/// edge set regardless of iteration order.
+fn canonical_pair<'a>(
+    a: &'a NatsPattern,
+    b: &'a NatsPattern,
+) -> (&'a NatsPattern, &'a NatsPattern) {
+    if Node::Subject(a.clone()).id() <= Node::Subject(b.clone()).id() {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 fn materialise_nodes(
@@ -686,5 +845,210 @@ mod tests {
         let ids1: Vec<_> = g1.edges.iter().map(|e| (e.from.id(), e.to.id())).collect();
         let ids2: Vec<_> = g2.edges.iter().map(|e| (e.from.id(), e.to.id())).collect();
         assert_eq!(ids1, ids2);
+    }
+
+    // ---- P1 commit 4: Matches sweep tests ----
+
+    /// Edge-kind discriminant ordering is load-bearing — the sort
+    /// comparator in `materialise_edges` casts to `u8`. Lock the
+    /// values so future variants can't accidentally reorder.
+    #[test]
+    fn edge_kind_discriminants_locked() {
+        assert_eq!(EdgeKind::Publish as u8, 0);
+        assert_eq!(EdgeKind::Consume as u8, 1);
+        assert_eq!(EdgeKind::Ingress as u8, 2);
+        assert_eq!(EdgeKind::Egress as u8, 3);
+        assert_eq!(EdgeKind::Matches as u8, 4);
+    }
+
+    fn pub_site(crate_name: &str, expr: &str) -> (String, RawCallSite) {
+        site(crate_name, CallKind::Publish, &format!("\"{expr}\""))
+    }
+    fn sub_site(crate_name: &str, expr: &str) -> (String, RawCallSite) {
+        site(crate_name, CallKind::Subscribe, &format!("\"{expr}\""))
+    }
+    fn count_matches(g: &Graph) -> usize {
+        g.edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Matches))
+            .count()
+    }
+    fn matches_pairs(g: &Graph) -> Vec<(String, String)> {
+        let mut out: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Matches))
+            .map(|e| (e.from.id(), e.to.id()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn matches_overlap_star_vs_literal() {
+        // foo.bar (publisher) + foo.* (consumer) → overlap.
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("a", "foo.bar"), sub_site("b", "foo.*")],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 1);
+    }
+
+    #[test]
+    fn matches_no_overlap_when_unrelated() {
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("a", "foo.bar"), sub_site("b", "baz.qux")],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 0);
+    }
+
+    #[test]
+    fn matches_star_cross_position() {
+        // The case coverage misses: foo.*.baz ↔ foo.bar.* overlap on
+        // foo.bar.baz. Neither covers the other.
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("a", "foo.*.baz"), sub_site("b", "foo.bar.*")],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 1);
+    }
+
+    #[test]
+    fn matches_publisher_publisher_overlap() {
+        // Two publishers with overlapping subject families: a real
+        // drift smell, not just routing surface. Our all-pairs sweep
+        // catches it (matches challenge-02 hand-count of 8 on Gordon).
+        let inputs = GraphInputs {
+            call_sites: vec![
+                pub_site("a", "market.klines.binance.*.*.*"),
+                pub_site("b", "market.klines.binance.spot.*.1m"),
+            ],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 1);
+    }
+
+    #[test]
+    fn matches_canonical_direction_min_id_first() {
+        // Symmetric edge → canonical (min(id), max(id)). Run twice
+        // with reversed insertion order, assert identical edge set.
+        let order_a = GraphInputs {
+            call_sites: vec![pub_site("a", "foo.bar"), sub_site("b", "foo.*")],
+            ..Default::default()
+        };
+        let order_b = GraphInputs {
+            call_sites: vec![pub_site("b", "foo.*"), sub_site("a", "foo.bar")],
+            ..Default::default()
+        };
+        let (g1, _) = build_graph(&order_a, &SymbolIndex::new());
+        let (g2, _) = build_graph(&order_b, &SymbolIndex::new());
+        assert_eq!(matches_pairs(&g1), matches_pairs(&g2));
+
+        // And verify the from-id is the lexicographically smaller one.
+        let match_edge = g1
+            .edges
+            .iter()
+            .find(|e| matches!(e.kind, EdgeKind::Matches))
+            .expect("expected Matches edge");
+        assert!(
+            match_edge.from.id() <= match_edge.to.id(),
+            "canonical pair: from.id ({}) must <= to.id ({})",
+            match_edge.from.id(),
+            match_edge.to.id()
+        );
+    }
+
+    #[test]
+    fn matches_transitive_non_closure() {
+        // A↔B and C↔B does NOT imply A↔C.
+        // A = foo.bar.baz, B = foo.*.baz, C = foo.qux.baz.
+        let inputs = GraphInputs {
+            call_sites: vec![
+                pub_site("a", "foo.bar.baz"),
+                pub_site("c", "foo.qux.baz"),
+                sub_site("b", "foo.*.baz"),
+            ],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        // Expect 2 Matches edges (A↔B, C↔B), not 3.
+        assert_eq!(count_matches(&g), 2);
+    }
+
+    #[test]
+    fn matches_identical_patterns_emit_no_edge() {
+        // Two publishers of `foo.bar` — identical pattern. The
+        // sweep skips `a == b` so no Matches edge is emitted.
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("a", "foo.bar"), pub_site("b", "foo.bar")],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 0);
+    }
+
+    #[test]
+    fn matches_ingress_target_participates_in_sweep() {
+        // Ingress targets are publisher-side subjects per the sweep
+        // definition. Verify they trigger Matches edges.
+        let inputs = GraphInputs {
+            call_sites: vec![sub_site("svc", "foo.*")],
+            ingress: vec![Ingress {
+                name: "EXT".into(),
+                into: vec!["foo.bar".into()],
+                crate_name: None,
+            }],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 1);
+    }
+
+    #[test]
+    fn matches_egress_source_participates_in_sweep() {
+        let inputs = GraphInputs {
+            call_sites: vec![pub_site("svc", "foo.bar")],
+            egress: vec![Egress {
+                name: "SINK".into(),
+                from_crate: "svc".into(),
+                triggered_by: vec!["foo.*".into()],
+            }],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(count_matches(&g), 1);
+    }
+
+    #[test]
+    fn matches_determinism_1000_runs_byte_stable() {
+        // Synthesis §P0-H invariant 1: 1000-run byte-stability on a
+        // Matches-edge-producing fixture. The brute-force loop is
+        // cheap (build is sub-ms) and locks the canonical sort.
+        let inputs = GraphInputs {
+            call_sites: vec![
+                pub_site("a", "market.klines.binance.*.*.*"),
+                pub_site("b", "market.klines.binance.spot.*.1m"),
+                sub_site("c", "market.klines.binance.spot.*.*"),
+                sub_site("d", "risk.events.>"),
+                pub_site("e", "risk.events.*"),
+            ],
+            ..Default::default()
+        };
+        let index = SymbolIndex::new();
+        let (baseline, _) = build_graph(&inputs, &index);
+        let baseline_pairs = matches_pairs(&baseline);
+        for run in 1..1000 {
+            let (g, _) = build_graph(&inputs, &index);
+            assert_eq!(
+                matches_pairs(&g),
+                baseline_pairs,
+                "run #{run} diverged from baseline"
+            );
+        }
     }
 }
