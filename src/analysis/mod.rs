@@ -11,6 +11,7 @@
 //! for the full design rationale).
 
 pub mod callsite;
+pub mod graph;
 pub mod subject;
 pub mod symbol_index;
 
@@ -18,6 +19,7 @@ pub use callsite::{
     extract, CallKind, CallSiteConfig, ConsumerSpec, MethodMatch, ParseError, PerFileCallSites,
     PublisherKind, PublisherSpec, RawCallSite,
 };
+pub use graph::{build_graph, Egress, GraphDiagnostic, GraphInputs, Ingress};
 pub use subject::{
     resolve, ResolveOutcome, Scope, SubjectPattern, UnresolvedReason, DEFAULT_DEPTH,
 };
