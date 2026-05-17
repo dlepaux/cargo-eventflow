@@ -1,0 +1,101 @@
+# .eventflow.toml — Gordon workspace (the calibration target).
+#
+# Derived from the bus survey at
+# https://github.com/dlepaux/gordon-workspace (private) —
+# 12 publish/subscribe call sites across 5 v7 services
+# (gordon-bot, gordon-executor, gordon-data, gordon-risk,
+# gordon-manager) using gordon-bus + gordon-protocol.
+
+schema_version = 1
+
+[workspace]
+services = [
+    "gordon-bot",
+    "gordon-executor",
+    "gordon-data",
+    "gordon-risk",
+    "gordon-manager",
+]
+libraries = [
+    "gordon-bus",
+    "gordon-protocol",
+    "gordon-domain",
+    "gordon-kernel",
+    "gordon-platform",
+]
+ignore = ["gordon-test-db", "gordon-lab", "gordon-console", "gordon-docs"]
+
+[bus]
+method_match = "name+trait_path_hint"
+
+# Trait method (gordon-bus::Publisher::publish).
+[[bus.publisher]]
+kind = "trait"
+path = "gordon_bus::Publisher"
+method = "publish"
+subject_arg_index = 0
+
+# Inherent outbox-first method (gordon-bus::nats::NatsPublisher).
+# arg 0 is &mut Transaction; subject is arg 1.
+[[bus.publisher]]
+kind = "inherent"
+type = "gordon_bus::nats::NatsPublisher"
+method = "publish_within"
+subject_arg_index = 1
+
+[[bus.publisher]]
+kind = "inherent"
+type = "gordon_bus::nats::NatsPublisher"
+method = "publish_full"
+subject_arg_index = 0
+
+[[bus.consumer]]
+kind = "trait"
+path = "gordon_bus::Consumer"
+method = "subscribe"
+subject_arg_index = 0
+consumer_name_arg_index = 1
+
+[subjects]
+helper_crates = ["gordon-protocol", "gordon-domain"]
+subject_builder_methods = ["nats_subject"]
+# Free-function builder for risk.events.* subjects.
+subject_builder_functions = ["build_breaker_subject"]
+collapse_wildcards = "auto"
+
+[[ingress.source]]
+name = "Binance WebSocket"
+into = [
+    "market.klines.binance.spot.*.1m",
+    "market.klines.binance.perp.*.1m",
+]
+crate = "gordon-data"
+
+[[ingress.source]]
+name = "Operator (REST)"
+into = ["risk.commands"]
+crate = "gordon-manager"
+
+[[egress.sink]]
+name = "Binance REST (order placement)"
+from_crate = "gordon-executor"
+triggered_by = ["intents.executor"]
+
+[[egress.sink]]
+name = "Console WebSocket (browser fan-out)"
+from_crate = "gordon-manager"
+triggered_by = ["trading.fills.>", "risk.events.>"]
+
+[output]
+format = "mermaid"
+path = "docs/event-flow.md"
+markdown = true
+
+[output.mermaid]
+theme = "default"
+group_by_publisher = true
+
+[diagnostics]
+max_warnings = 20
+# legacy pg-LISTEN holdover; will migrate to NATS in a future epic.
+allow_dynamic = []

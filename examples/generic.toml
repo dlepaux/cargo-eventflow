@@ -1,0 +1,58 @@
+# .eventflow.toml — generic NATS + Rust workspace.
+#
+# This is the shape `cargo eventflow init` produces by default
+# when no project-specific publisher trait is detected.
+# Adjust the `path` / `type` values to match your bus library,
+# then run `cargo eventflow mermaid > docs/event-flow.md`.
+
+schema_version = 1
+
+[workspace]
+# Every workspace member that publishes or subscribes.
+services = ["*"]
+
+# Crates that DEFINE subjects but don't pub/sub themselves
+# (subject constants, payload types, helper functions).
+libraries = []
+
+# Crates to skip entirely.
+ignore = ["*-test-*", "*-bench", "examples-*"]
+
+[bus]
+# Default tightens false positives. See README §"Why name+trait_path_hint".
+method_match = "name+trait_path_hint"
+
+[[bus.publisher]]
+kind = "trait"
+path = "your_bus::Publisher"
+method = "publish"
+subject_arg_index = 0
+
+[[bus.consumer]]
+kind = "trait"
+path = "your_bus::Consumer"
+method = "subscribe"
+subject_arg_index = 0
+consumer_name_arg_index = 1
+
+[subjects]
+# Crates whose `pub const X: &str = "..."` and
+# `impl Foo { fn nats_subject(...) }` are followed during resolve.
+# Same-crate is always searched first.
+helper_crates = []
+subject_builder_methods = ["nats_subject"]
+subject_builder_functions = []
+collapse_wildcards = "auto"
+
+[output]
+format = "mermaid"
+path = "docs/event-flow.md"
+markdown = true
+
+[output.mermaid]
+theme = "default"   # "default" | "high-contrast" | "monochrome" | "custom"
+group_by_publisher = true
+
+[diagnostics]
+max_warnings = 20
+allow_dynamic = []

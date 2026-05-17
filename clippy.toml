@@ -1,0 +1,6 @@
+# clippy.toml — project-wide lint thresholds.
+# Per-lint lint-table lives in workspace lints section once Cargo
+# supports it stably; for now use deny-warnings via CI flag.
+
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 8

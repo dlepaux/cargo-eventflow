@@ -1,0 +1,6 @@
+# rustfmt.toml — pinned so format-on-save behaves identically
+# across contributors. Empty values keep rustfmt's defaults but
+# pin them against version drift.
+
+edition = "2021"
+max_width = 100

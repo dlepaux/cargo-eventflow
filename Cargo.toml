@@ -1,0 +1,55 @@
+[package]
+name = "cargo-eventflow"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.78"
+authors = ["David Lepaux <d.lepaux@gmail.com>"]
+description = "Auto-derive event-flow diagrams from Rust source for NATS-based systems. Mermaid output with CI drift gating."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dlepaux/cargo-eventflow"
+documentation = "https://docs.rs/cargo-eventflow"
+homepage = "https://github.com/dlepaux/cargo-eventflow"
+readme = "README.md"
+keywords = ["cargo-subcommand", "nats", "event-driven", "documentation", "mermaid"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+
+[lib]
+name = "cargo_eventflow"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cargo-eventflow"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+syn = { version = "2", default-features = false, features = ["parsing", "full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+cargo_metadata = "0.18"
+ignore = "0.4"
+globset = "0.4"
+
+# anyhow is bin-only — banned from lib.rs per synthesis §P0-E.
+# Enforced by code review; lib.rs depends on thiserror only.
+anyhow = "1"
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
+expect-test = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3"
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
