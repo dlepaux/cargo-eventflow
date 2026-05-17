@@ -73,6 +73,7 @@ dependencies = [
  "ignore",
  "insta",
  "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
  "syn",
