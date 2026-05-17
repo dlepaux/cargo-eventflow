@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::model::{Edge, EdgeKind, Graph, Node, ServiceId, SubjectPattern};
 
 use super::callsite::{CallKind, RawCallSite};
-use super::subject::{ResolveOutcome, Scope};
+use super::subject::{ResolveOutcome, Scope, UnresolvedReason};
 use super::symbol_index::SymbolIndex;
 
 /// One declared ingress (data source feeding the system).
@@ -62,6 +62,42 @@ pub enum GraphDiagnostic {
         /// Best-effort reason.
         reason: String,
     },
+    /// A subscribe call site's durable consumer-name argument
+    /// couldn't be resolved. The diagram still renders (the edge
+    /// label falls back to `?`); this signals an opportunity to
+    /// add a `// eventflow:` annotation or fix the resolver
+    /// config.
+    UnresolvedConsumerName {
+        /// Service crate the subscribe call lives in.
+        crate_name: String,
+        /// Where in the source.
+        location: String,
+        /// Best-effort reason.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for GraphDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnresolvedSubject {
+                crate_name,
+                location,
+                reason,
+            } => write!(
+                f,
+                "unresolved subject in {crate_name} at {location}: {reason}"
+            ),
+            Self::UnresolvedConsumerName {
+                crate_name,
+                location,
+                reason,
+            } => write!(
+                f,
+                "unresolved consumer name in {crate_name} at {location}: {reason}"
+            ),
+        }
+    }
 }
 
 /// Run the resolver per call site, group by resolved subject,
@@ -95,33 +131,63 @@ fn resolve_all(
 ) -> Vec<ResolvedSite> {
     let mut resolved: Vec<ResolvedSite> = Vec::with_capacity(inputs.call_sites.len());
     for (crate_name, site) in &inputs.call_sites {
-        let mut scope = Scope::new(
-            crate_name,
-            &inputs.helper_crates,
-            &inputs.subject_builder_methods,
-            &inputs.subject_builder_functions,
-        );
-        scope.fn_body_source = site.enclosing_fn_body.as_deref();
-        let outcome = super::subject::resolve(&site.subject_expr, index, &scope);
-        let subject = match &outcome {
-            ResolveOutcome::Resolved(s) | ResolveOutcome::PartiallyResolved(s) => s.clone(),
-            ResolveOutcome::Unresolved(reason) => {
-                diagnostics.push(GraphDiagnostic::UnresolvedSubject {
+        let (subject, subject_diag) =
+            resolve_call_site_expr(&site.subject_expr, site, crate_name, inputs, index);
+        if let Some(reason) = subject_diag {
+            diagnostics.push(GraphDiagnostic::UnresolvedSubject {
+                crate_name: crate_name.clone(),
+                location: format!("{}:{}", site.file.display(), site.line),
+                reason: format!("{reason:?}"),
+            });
+        }
+        let consumer_name = site.consumer_name_expr.as_deref().map(|expr| {
+            let (rendered, diag) = resolve_call_site_expr(expr, site, crate_name, inputs, index);
+            if let Some(reason) = diag {
+                diagnostics.push(GraphDiagnostic::UnresolvedConsumerName {
                     crate_name: crate_name.clone(),
                     location: format!("{}:{}", site.file.display(), site.line),
                     reason: format!("{reason:?}"),
                 });
-                "?".to_string()
             }
-        };
+            rendered
+        });
         resolved.push(ResolvedSite {
             crate_name: crate_name.clone(),
             subject,
             kind: site.kind,
-            consumer_name: site.consumer_name_expr.as_deref().map(strip_quotes),
+            consumer_name,
         });
     }
     resolved
+}
+
+/// Run the subject resolver against any string-valued runtime
+/// expression captured at a call site. Used for both
+/// `subject_expr` and `consumer_name_expr` — both are NATS call
+/// arguments resolved against the same scope.
+///
+/// Returns the rendered pattern (`*` / `>` for dynamic segments,
+/// `?` for fully unresolvable) plus an optional reason when
+/// resolution gave up so the caller can emit a structured
+/// diagnostic.
+fn resolve_call_site_expr(
+    snippet: &str,
+    site: &RawCallSite,
+    crate_name: &str,
+    inputs: &GraphInputs,
+    index: &SymbolIndex,
+) -> (String, Option<UnresolvedReason>) {
+    let mut scope = Scope::new(
+        crate_name,
+        &inputs.helper_crates,
+        &inputs.subject_builder_methods,
+        &inputs.subject_builder_functions,
+    );
+    scope.fn_body_source = site.enclosing_fn_body.as_deref();
+    match super::subject::resolve(snippet, index, &scope) {
+        ResolveOutcome::Resolved(s) | ResolveOutcome::PartiallyResolved(s) => (s, None),
+        ResolveOutcome::Unresolved(reason) => ("?".to_string(), Some(reason)),
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -316,15 +382,6 @@ fn node_from_id(
     Node::Subject(id.to_string())
 }
 
-fn strip_quotes(s: &str) -> String {
-    let s = s.trim();
-    s.trim_start_matches('&')
-        .trim_start_matches('"')
-        .trim_end_matches('"')
-        .trim()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +454,145 @@ mod tests {
         let (graph, _) = build_graph(&inputs, &SymbolIndex::new());
         // 4 edges: 1 ingress, 1 publish, 1 consume, 1 egress
         assert_eq!(graph.edges.len(), 4);
+    }
+
+    fn subscribe_site(
+        crate_name: &str,
+        subject_expr: &str,
+        consumer_name_expr: Option<&str>,
+        fn_body: Option<&str>,
+    ) -> (String, RawCallSite) {
+        (
+            crate_name.to_string(),
+            RawCallSite {
+                kind: CallKind::Subscribe,
+                file: PathBuf::from(format!("{crate_name}/src/lib.rs")),
+                line: 1,
+                column: 1,
+                subject_expr: subject_expr.to_string(),
+                consumer_name_expr: consumer_name_expr.map(String::from),
+                matched_method: "subscribe".to_string(),
+                enclosing_fn_body: fn_body.map(String::from),
+            },
+        )
+    }
+
+    fn consume_label(g: &Graph) -> Option<&str> {
+        g.edges
+            .iter()
+            .find(|e| matches!(e.kind, EdgeKind::Consume))
+            .and_then(|e| e.label.as_deref())
+    }
+
+    #[test]
+    fn consumer_name_literal_resolves_to_self() {
+        let inputs = GraphInputs {
+            call_sites: vec![subscribe_site(
+                "svc",
+                "\"foo.bar\"",
+                Some("\"executor-default\""),
+                None,
+            )],
+            ..Default::default()
+        };
+        let (g, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert!(diags.is_empty(), "literal resolved cleanly");
+        assert_eq!(consume_label(&g), Some("executor-default"));
+    }
+
+    #[test]
+    fn consumer_name_reference_to_literal_strips_amp() {
+        let inputs = GraphInputs {
+            call_sites: vec![subscribe_site(
+                "svc",
+                "\"foo.bar\"",
+                Some("&\"my-durable\""),
+                None,
+            )],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(consume_label(&g), Some("my-durable"));
+    }
+
+    #[test]
+    fn consumer_name_local_binding_followed_via_fn_body() {
+        // Mirrors the Gordon shape: `let consumer_name_owned =
+        // BUS_CONSUMER_NAME.to_owned(); subscribe(&s, &consumer_name_owned)`.
+        let body = "{ let consumer_name_owned = \"executor-default\".to_owned(); subscribe(s, &consumer_name_owned); }";
+        let inputs = GraphInputs {
+            call_sites: vec![subscribe_site(
+                "svc",
+                "\"intents.executor\"",
+                Some("&consumer_name_owned"),
+                Some(body),
+            )],
+            ..Default::default()
+        };
+        let (g, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert!(diags.is_empty(), "local binding resolved");
+        assert_eq!(consume_label(&g), Some("executor-default"));
+    }
+
+    #[test]
+    fn consumer_name_format_macro_renders_wildcards() {
+        let body =
+            "{ let durable = format!(\"bot-{}-{}\", bot_id, symbol); subscribe(s, &durable); }";
+        let inputs = GraphInputs {
+            call_sites: vec![subscribe_site(
+                "svc",
+                "\"foo.bar\"",
+                Some("&durable"),
+                Some(body),
+            )],
+            ..Default::default()
+        };
+        let (g, _) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(consume_label(&g), Some("bot-*-*"));
+    }
+
+    #[test]
+    fn consumer_name_unresolvable_emits_diagnostic() {
+        // `something_runtime` is neither a let-binding nor a const
+        // nor a configured builder — must hit `?` and emit a
+        // structured diagnostic.
+        let inputs = GraphInputs {
+            call_sites: vec![subscribe_site(
+                "svc",
+                "\"foo.bar\"",
+                Some("&something_runtime"),
+                None,
+            )],
+            ..Default::default()
+        };
+        let (g, diags) = build_graph(&inputs, &SymbolIndex::new());
+        assert_eq!(consume_label(&g), Some("?"));
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, GraphDiagnostic::UnresolvedConsumerName { .. })),
+            "expected UnresolvedConsumerName diagnostic, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_byte_stable_across_runs() {
+        // Determinism check including the new diagnostic kind.
+        let inputs = GraphInputs {
+            call_sites: vec![subscribe_site(
+                "svc",
+                "\"foo.bar\"",
+                Some("&missing_var"),
+                None,
+            )],
+            ..Default::default()
+        };
+        let index = SymbolIndex::new();
+        let (_, d1) = build_graph(&inputs, &index);
+        let (_, d2) = build_graph(&inputs, &index);
+        let s1: Vec<String> = d1.iter().map(GraphDiagnostic::to_string).collect();
+        let s2: Vec<String> = d2.iter().map(GraphDiagnostic::to_string).collect();
+        assert_eq!(s1, s2);
     }
 
     #[test]

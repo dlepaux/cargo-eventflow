@@ -181,7 +181,8 @@ fn run_mermaid(
     let config = config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
-    let (graph, _diagnostics) = analyze_workspace(&manifest, &config)?;
+    let (graph, diagnostics) = analyze_workspace(&manifest, &config)?;
+    report_diagnostics(&diagnostics);
 
     let markdown = markdown_override.unwrap_or(config.output.markdown);
     let opts = MermaidOptions {
@@ -214,6 +215,7 @@ fn run_json(cli: &Cli, output: Option<&Path>) -> Result<()> {
     let config = config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let (graph, diagnostics) = analyze_workspace(&manifest, &config)?;
+    report_diagnostics(&diagnostics);
 
     let body = JsonOut {
         schema: "https://github.com/dlepaux/cargo-eventflow/schemas/v1.json",
@@ -316,6 +318,18 @@ fn resolve_config_path(cli: &Cli, manifest: &Path) -> Result<PathBuf> {
         .context("manifest path has no parent")?
         .to_path_buf();
     Ok(workspace_root.join(".eventflow.toml"))
+}
+
+/// Print analyzer diagnostics to stderr. Exit code stays 0 — these
+/// are warnings, not errors. `--strict-*` flags (story 05, v0.2)
+/// will escalate as needed.
+fn report_diagnostics(diagnostics: &[cargo_eventflow::analysis::GraphDiagnostic]) {
+    for d in diagnostics {
+        eprintln!("warning: {d}");
+    }
+    if !diagnostics.is_empty() {
+        eprintln!("({} diagnostic(s) — see above)", diagnostics.len());
+    }
 }
 
 fn write_output(path: Option<&Path>, content: &str) -> Result<()> {
