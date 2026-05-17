@@ -14,16 +14,13 @@ pub use pattern::{NatsPattern, ParseError as PatternParseError, Segment};
 /// Unique identifier for a service crate.
 pub type ServiceId = String;
 
-/// A resolved NATS subject pattern. Dynamic segments render as
-/// `*` (single segment) or `>` (tail). Unresolvable segments
-/// render as `?`.
+/// A resolved NATS subject pattern.
 ///
-/// Today still a `String` for backwards compat with the analysis
-/// pipeline. P1 commit 3 flips this to [`NatsPattern`] in the same
-/// patch that threads the type through `Node::Subject` and
-/// `collect_node_sets`. This commit (P1 commit 2) ships the algebra
-/// module standalone — no behaviour change here.
-pub type SubjectPattern = String;
+/// Carries [`NatsPattern`] since P1 commit 3 — a real structural
+/// type with well-formedness enforced at parse time. The alias is
+/// kept so older call sites can keep their name; new code should
+/// prefer [`NatsPattern`] directly.
+pub type SubjectPattern = NatsPattern;
 
 /// A node in the event-flow graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -31,7 +28,7 @@ pub enum Node {
     /// A service crate that publishes or consumes.
     Service(ServiceId),
     /// A NATS subject pattern.
-    Subject(SubjectPattern),
+    Subject(NatsPattern),
     /// An external data source feeding the system.
     Ingress(String),
     /// An external sink fed by the system.
@@ -45,7 +42,7 @@ impl Node {
     pub fn id(&self) -> String {
         match self {
             Self::Service(s) => format!("svc:{s}"),
-            Self::Subject(s) => format!("sub:{s}"),
+            Self::Subject(s) => format!("sub:{}", s.as_str()),
             Self::Ingress(s) => format!("ing:{s}"),
             Self::Egress(s) => format!("eg:{s}"),
         }
@@ -55,7 +52,8 @@ impl Node {
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
-            Self::Service(s) | Self::Subject(s) | Self::Ingress(s) | Self::Egress(s) => s,
+            Self::Service(s) | Self::Ingress(s) | Self::Egress(s) => s,
+            Self::Subject(s) => s.as_str(),
         }
     }
 }

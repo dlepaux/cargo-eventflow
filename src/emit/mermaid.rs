@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 
-use crate::model::{EdgeKind, Graph, Node};
+use crate::model::{EdgeKind, Graph, NatsPattern, Node};
 
 /// Configurable output options.
 #[derive(Debug, Clone, Default)]
@@ -175,7 +175,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions, ids: &IdM
                     out,
                     "    {}([\"{}\"])",
                     ids.for_node(&Node::Subject(subj.clone())),
-                    escape_label(subj)
+                    escape_label(subj.as_str())
                 );
             }
             let _ = writeln!(out, "  end");
@@ -191,7 +191,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions, ids: &IdM
                     out,
                     "    {}([\"{}\"])",
                     ids.for_node(&Node::Subject(subj.clone())),
-                    escape_label(subj)
+                    escape_label(subj.as_str())
                 );
             }
             let _ = writeln!(out, "  end");
@@ -202,7 +202,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions, ids: &IdM
                 out,
                 "  {}([\"{}\"])",
                 ids.for_node(&Node::Subject(subj.clone())),
-                escape_label(subj)
+                escape_label(subj.as_str())
             );
         }
     } else {
@@ -212,7 +212,7 @@ fn write_nodes(out: &mut String, graph: &Graph, opts: &MermaidOptions, ids: &IdM
                     out,
                     "  {}([\"{}\"])",
                     ids.for_node(node),
-                    escape_label(name)
+                    escape_label(name.as_str())
                 );
             }
         }
@@ -271,13 +271,13 @@ fn write_styles(out: &mut String, graph: &Graph, opts: &MermaidOptions) {
 }
 
 struct Groups {
-    by_publisher: BTreeMap<String, Vec<String>>,
-    multi_publisher: Vec<String>,
-    orphans: Vec<String>,
+    by_publisher: BTreeMap<String, Vec<NatsPattern>>,
+    multi_publisher: Vec<NatsPattern>,
+    orphans: Vec<NatsPattern>,
 }
 
 fn group_subjects_by_publisher(graph: &Graph) -> Groups {
-    let mut publishers_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut publishers_of: BTreeMap<NatsPattern, Vec<String>> = BTreeMap::new();
     for edge in &graph.edges {
         if matches!(edge.kind, EdgeKind::Publish) {
             if let (Node::Service(svc), Node::Subject(sub)) = (&edge.from, &edge.to) {
@@ -289,9 +289,9 @@ fn group_subjects_by_publisher(graph: &Graph) -> Groups {
         }
     }
 
-    let mut by_publisher: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut multi_publisher: Vec<String> = Vec::new();
-    let mut orphans: Vec<String> = Vec::new();
+    let mut by_publisher: BTreeMap<String, Vec<NatsPattern>> = BTreeMap::new();
+    let mut multi_publisher: Vec<NatsPattern> = Vec::new();
+    let mut orphans: Vec<NatsPattern> = Vec::new();
 
     for node in &graph.nodes {
         if let Node::Subject(s) = node {
@@ -459,7 +459,12 @@ fn escape_label(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Edge, EdgeKind, Graph, Node};
+    use crate::model::{Edge, EdgeKind, Graph, NatsPattern, Node};
+
+    /// Test-only helper: parse a literal pattern, panic on failure.
+    fn sub(s: &str) -> Node {
+        Node::Subject(NatsPattern::parse(s).expect("test fixture parses"))
+    }
 
     fn empty_graph() -> Graph {
         Graph {
@@ -473,17 +478,17 @@ mod tests {
             nodes: vec![
                 Node::Service("svc-a".into()),
                 Node::Service("svc-b".into()),
-                Node::Subject("foo.bar".into()),
+                sub("foo.bar"),
             ],
             edges: vec![
                 Edge {
                     from: Node::Service("svc-a".into()),
-                    to: Node::Subject("foo.bar".into()),
+                    to: sub("foo.bar"),
                     kind: EdgeKind::Publish,
                     label: None,
                 },
                 Edge {
-                    from: Node::Subject("foo.bar".into()),
+                    from: sub("foo.bar"),
                     to: Node::Service("svc-b".into()),
                     kind: EdgeKind::Consume,
                     label: Some("my-durable".into()),
@@ -575,13 +580,13 @@ mod tests {
         let g = Graph {
             nodes: vec![
                 Node::Service("data".into()),
-                Node::Subject("market.klines".into()),
+                sub("market.klines"),
                 Node::Ingress("Binance WS".into()),
                 Node::Egress("Binance REST".into()),
             ],
             edges: vec![Edge {
                 from: Node::Ingress("Binance WS".into()),
-                to: Node::Subject("market.klines".into()),
+                to: sub("market.klines"),
                 kind: EdgeKind::Ingress,
                 label: None,
             }],
@@ -620,8 +625,11 @@ mod tests {
 
     #[test]
     fn label_quotes_escaped() {
+        // Subject labels can't contain `"` anymore (strict parser
+        // rejects). Ingress/egress names still accept arbitrary
+        // strings, so use one of those to test quote escaping.
         let g = Graph {
-            nodes: vec![Node::Subject("contains \"quote\"".into())],
+            nodes: vec![Node::Ingress("contains \"quote\"".into())],
             edges: vec![],
         };
         let out = render_mermaid(&g, &MermaidOptions::default());
@@ -639,10 +647,10 @@ mod tests {
     fn collision_graph() -> Graph {
         Graph {
             nodes: vec![
-                Node::Subject("risk.events.*".into()),
-                Node::Subject("risk.events.s".into()),
-                Node::Subject("risk.events.>".into()),
-                Node::Subject("risk.events.g".into()),
+                sub("risk.events.*"),
+                sub("risk.events.s"),
+                sub("risk.events.>"),
+                sub("risk.events.g"),
             ],
             edges: vec![],
         }
@@ -710,21 +718,17 @@ mod tests {
         // Edge endpoints must resolve through the same map as node ids
         // — otherwise edges would point at undefined / wrong nodes.
         let g = Graph {
-            nodes: vec![
-                Node::Service("svc".into()),
-                Node::Subject("foo.*".into()),
-                Node::Subject("foo.s".into()),
-            ],
+            nodes: vec![Node::Service("svc".into()), sub("foo.*"), sub("foo.s")],
             edges: vec![
                 Edge {
                     from: Node::Service("svc".into()),
-                    to: Node::Subject("foo.*".into()),
+                    to: sub("foo.*"),
                     kind: EdgeKind::Publish,
                     label: None,
                 },
                 Edge {
                     from: Node::Service("svc".into()),
-                    to: Node::Subject("foo.s".into()),
+                    to: sub("foo.s"),
                     kind: EdgeKind::Publish,
                     label: None,
                 },
@@ -749,11 +753,11 @@ mod tests {
             nodes: vec![
                 Node::Service("svc-x".into()),
                 Node::Service("sg_svc_x".into()),
-                Node::Subject("foo".into()),
+                sub("foo"),
             ],
             edges: vec![Edge {
                 from: Node::Service("svc-x".into()),
-                to: Node::Subject("foo".into()),
+                to: sub("foo"),
                 kind: EdgeKind::Publish,
                 label: None,
             }],

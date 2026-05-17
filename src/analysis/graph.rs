@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::model::{Edge, EdgeKind, Graph, Node, ServiceId, SubjectPattern};
+use crate::model::{Edge, EdgeKind, Graph, NatsPattern, Node, ServiceId};
 
 use super::callsite::{CallKind, RawCallSite};
 use super::subject::{ResolveOutcome, Scope, UnresolvedReason};
@@ -75,6 +75,19 @@ pub enum GraphDiagnostic {
         /// Best-effort reason.
         reason: String,
     },
+    /// A subject string (from resolver, ingress, or egress) failed
+    /// `NatsPattern::parse`. The subject is replaced with the `?`
+    /// fallback so the diagram still renders; check the source for
+    /// illegal characters / non-ASCII / mid-pattern `>`.
+    MalformedSubject {
+        /// Where the subject came from: `"resolver"`, `"ingress:<name>"`,
+        /// or `"egress:<name>"`.
+        origin: String,
+        /// The raw subject string that failed parse.
+        raw: String,
+        /// The parse error message.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for GraphDiagnostic {
@@ -96,6 +109,11 @@ impl std::fmt::Display for GraphDiagnostic {
                 f,
                 "unresolved consumer name in {crate_name} at {location}: {reason}"
             ),
+            Self::MalformedSubject {
+                origin,
+                raw,
+                reason,
+            } => write!(f, "malformed subject from {origin}: {raw:?} ({reason})"),
         }
     }
 }
@@ -111,7 +129,8 @@ impl std::fmt::Display for GraphDiagnostic {
 pub fn build_graph(inputs: &GraphInputs, index: &SymbolIndex) -> (Graph, Vec<GraphDiagnostic>) {
     let mut diagnostics = Vec::new();
     let resolved = resolve_all(inputs, index, &mut diagnostics);
-    let (services, subjects, ingress_names, egress_names) = collect_node_sets(&resolved, inputs);
+    let (services, subjects, ingress_names, egress_names) =
+        collect_node_sets(&resolved, inputs, &mut diagnostics);
     let edges = collect_edges(&resolved, inputs);
     let nodes = materialise_nodes(&services, &subjects, &ingress_names, &egress_names);
     let edge_list = materialise_edges(edges, &services, &subjects, &ingress_names, &egress_names);
@@ -131,7 +150,7 @@ fn resolve_all(
 ) -> Vec<ResolvedSite> {
     let mut resolved: Vec<ResolvedSite> = Vec::with_capacity(inputs.call_sites.len());
     for (crate_name, site) in &inputs.call_sites {
-        let (subject, subject_diag) =
+        let (subject_str, subject_diag) =
             resolve_call_site_expr(&site.subject_expr, site, crate_name, inputs, index);
         if let Some(reason) = subject_diag {
             diagnostics.push(GraphDiagnostic::UnresolvedSubject {
@@ -140,6 +159,7 @@ fn resolve_all(
                 reason: format!("{reason:?}"),
             });
         }
+        let subject = parse_subject_or_fallback(&subject_str, "resolver", diagnostics);
         let consumer_name = site.consumer_name_expr.as_deref().map(|expr| {
             let (rendered, diag) = resolve_call_site_expr(expr, site, crate_name, inputs, index);
             if let Some(reason) = diag {
@@ -190,18 +210,45 @@ fn resolve_call_site_expr(
     }
 }
 
+/// Try to parse `raw` as a [`NatsPattern`]. On failure, push a
+/// `GraphDiagnostic::MalformedSubject` and fall back to the `?`
+/// sentinel pattern so the diagram still renders. `origin` is a
+/// human-readable label (`"resolver"`, `"ingress:<name>"`,
+/// `"egress:<name>"`) for the diagnostic message.
+fn parse_subject_or_fallback(
+    raw: &str,
+    origin: &str,
+    diagnostics: &mut Vec<GraphDiagnostic>,
+) -> NatsPattern {
+    match NatsPattern::parse(raw) {
+        Ok(p) => p,
+        Err(err) => {
+            diagnostics.push(GraphDiagnostic::MalformedSubject {
+                origin: origin.to_string(),
+                raw: raw.to_string(),
+                reason: err.to_string(),
+            });
+            // `?` is a single legal literal token under the strict
+            // parser; safe fallback that produces a visible sentinel
+            // in the rendered diagram.
+            NatsPattern::parse("?").expect("? is a legal literal token")
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn collect_node_sets(
     resolved: &[ResolvedSite],
     inputs: &GraphInputs,
+    diagnostics: &mut Vec<GraphDiagnostic>,
 ) -> (
     BTreeSet<ServiceId>,
-    BTreeSet<SubjectPattern>,
+    BTreeSet<NatsPattern>,
     BTreeSet<String>,
     BTreeSet<String>,
 ) {
     let mut services: BTreeSet<ServiceId> = BTreeSet::new();
-    let mut subjects: BTreeSet<SubjectPattern> = BTreeSet::new();
+    let mut subjects: BTreeSet<NatsPattern> = BTreeSet::new();
     let mut ingress_names: BTreeSet<String> = BTreeSet::new();
     let mut egress_names: BTreeSet<String> = BTreeSet::new();
 
@@ -212,7 +259,8 @@ fn collect_node_sets(
     for ing in &inputs.ingress {
         ingress_names.insert(ing.name.clone());
         for s in &ing.into {
-            subjects.insert(s.clone());
+            let origin = format!("ingress:{}", ing.name);
+            subjects.insert(parse_subject_or_fallback(s, &origin, diagnostics));
         }
         if let Some(c) = &ing.crate_name {
             services.insert(c.clone());
@@ -222,7 +270,8 @@ fn collect_node_sets(
         egress_names.insert(eg.name.clone());
         services.insert(eg.from_crate.clone());
         for s in &eg.triggered_by {
-            subjects.insert(s.clone());
+            let origin = format!("egress:{}", eg.name);
+            subjects.insert(parse_subject_or_fallback(s, &origin, diagnostics));
         }
     }
     (services, subjects, ingress_names, egress_names)
@@ -257,12 +306,17 @@ fn collect_edges(
             }
         }
     }
+    // Ingress/egress subject parsing already produced diagnostics in
+    // `collect_node_sets`; here we re-parse silently (the fallback `?`
+    // pattern matches what `collect_node_sets` inserted into the
+    // subjects set, so the edge endpoints resolve correctly).
     for ing in &inputs.ingress {
         for subject in &ing.into {
+            let pat = parse_subject_silent(subject);
             edges.insert(
                 EdgeKey {
                     from: Node::Ingress(ing.name.clone()).id(),
-                    to: Node::Subject(subject.clone()).id(),
+                    to: Node::Subject(pat).id(),
                     kind: EdgeKind::Ingress,
                 },
                 (EdgeKind::Ingress, None),
@@ -271,9 +325,10 @@ fn collect_edges(
     }
     for eg in &inputs.egress {
         for subject in &eg.triggered_by {
+            let pat = parse_subject_silent(subject);
             edges.insert(
                 EdgeKey {
-                    from: Node::Subject(subject.clone()).id(),
+                    from: Node::Subject(pat).id(),
                     to: Node::Egress(eg.name.clone()).id(),
                     kind: EdgeKind::Egress,
                 },
@@ -284,9 +339,17 @@ fn collect_edges(
     edges
 }
 
+/// Parse without emitting a diagnostic; `collect_node_sets` already
+/// surfaced the failure. Returns the same `?` fallback so edge keys
+/// resolve to existing subject nodes.
+fn parse_subject_silent(raw: &str) -> NatsPattern {
+    NatsPattern::parse(raw)
+        .unwrap_or_else(|_| NatsPattern::parse("?").expect("? is a legal literal token"))
+}
+
 fn materialise_nodes(
     services: &BTreeSet<ServiceId>,
-    subjects: &BTreeSet<SubjectPattern>,
+    subjects: &BTreeSet<NatsPattern>,
     ingress: &BTreeSet<String>,
     egress: &BTreeSet<String>,
 ) -> Vec<Node> {
@@ -309,7 +372,7 @@ fn materialise_nodes(
 fn materialise_edges(
     edges: BTreeMap<EdgeKey, (EdgeKind, Option<String>)>,
     services: &BTreeSet<String>,
-    subjects: &BTreeSet<String>,
+    subjects: &BTreeSet<NatsPattern>,
     ingress: &BTreeSet<String>,
     egress: &BTreeSet<String>,
 ) -> Vec<Edge> {
@@ -335,7 +398,7 @@ fn materialise_edges(
 
 struct ResolvedSite {
     crate_name: String,
-    subject: String,
+    subject: NatsPattern,
     kind: CallKind,
     consumer_name: Option<String>,
 }
@@ -350,7 +413,7 @@ struct EdgeKey {
 fn node_from_id(
     id: &str,
     services: &BTreeSet<String>,
-    subjects: &BTreeSet<String>,
+    subjects: &BTreeSet<NatsPattern>,
     ingress: &BTreeSet<String>,
     egress: &BTreeSet<String>,
 ) -> Node {
@@ -362,10 +425,19 @@ fn node_from_id(
         return Node::Service(rest.to_string());
     }
     if let Some(rest) = id.strip_prefix("sub:") {
-        if let Some(s) = subjects.get(rest) {
-            return Node::Subject(s.clone());
+        // Re-parse the subject from the id; on success, look up the
+        // canonical instance in the subjects set (preserves
+        // structural identity for `BTreeSet::contains` callers).
+        if let Ok(pat) = NatsPattern::parse(rest) {
+            if let Some(s) = subjects.get(&pat) {
+                return Node::Subject(s.clone());
+            }
+            return Node::Subject(pat);
         }
-        return Node::Subject(rest.to_string());
+        // Subject id failed re-parse: should be unreachable because
+        // ids only originate from existing NatsPattern instances.
+        // Fall back to `?` rather than panic.
+        return Node::Subject(parse_subject_silent(rest));
     }
     if let Some(rest) = id.strip_prefix("ing:") {
         if let Some(s) = ingress.get(rest) {
@@ -379,7 +451,10 @@ fn node_from_id(
         }
         return Node::Egress(rest.to_string());
     }
-    Node::Subject(id.to_string())
+    // Unknown id prefix (shouldn't happen — every Node::id() emits
+    // one of the four known prefixes). Treat as a literal subject for
+    // resilience; fall back to `?` if the id itself is unparseable.
+    Node::Subject(parse_subject_silent(id))
 }
 
 #[cfg(test)]
@@ -423,12 +498,12 @@ mod tests {
             .iter()
             .any(|e| matches!(e.kind, EdgeKind::Publish)
                 && matches!(&e.from, Node::Service(s) if s == "svc-a")
-                && matches!(&e.to, Node::Subject(s) if s == "foo.bar")));
+                && matches!(&e.to, Node::Subject(s) if s.as_str() == "foo.bar")));
         assert!(graph
             .edges
             .iter()
             .any(|e| matches!(e.kind, EdgeKind::Consume)
-                && matches!(&e.from, Node::Subject(s) if s == "foo.bar")
+                && matches!(&e.from, Node::Subject(s) if s.as_str() == "foo.bar")
                 && matches!(&e.to, Node::Service(s) if s == "svc-b")));
     }
 
