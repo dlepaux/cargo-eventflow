@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
-
 // cargo-eventflow CLI entry. v0.1: `mermaid` and `json` wired to
 // the full library pipeline. `dot` / `d2` / `check` / `explain` /
 // `init` print a "not yet implemented" stub.
-
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 

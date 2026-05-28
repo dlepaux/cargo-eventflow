@@ -1,10 +1,8 @@
 #![forbid(unsafe_code)]
-
 // cargo-eventflow library surface.
 // Stub for story 00 — real implementation lands in stories 01-04.
 // See plan in https://github.com/dlepaux/cargo-eventflow (or gordon-workspace
 // plan/active/cargo-eventflow/ for the full epic).
-
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
