@@ -135,7 +135,7 @@ fn main() -> ExitCode {
     match run(&cli, command) {
         Ok(()) => ExitCode::from(0),
         Err(err) => {
-            eprintln!("error: {err:#}"); // allow-println: CLI output
+            eprintln!("error: {err:#}");
             ExitCode::from(2)
         }
     }
@@ -150,19 +150,19 @@ fn run(cli: &Cli, command: Command) -> Result<()> {
         } => run_mermaid(cli, output.as_deref(), markdown, include_version_stamp),
         Command::Json { output } => run_json(cli, output.as_deref()),
         Command::Dot { .. } | Command::D2 { .. } => {
-            eprintln!("dot / d2 emit deferred to v0.2 — use `mermaid` for now"); // allow-println: CLI output
+            eprintln!("dot / d2 emit deferred to v0.2 — use `mermaid` for now");
             Ok(())
         }
         Command::Check { .. } => {
-            eprintln!("check subcommand deferred to v0.2 — regenerate manually and diff via git"); // allow-println: CLI output
+            eprintln!("check subcommand deferred to v0.2 — regenerate manually and diff via git");
             Ok(())
         }
         Command::Explain { .. } => {
-            eprintln!("explain subcommand deferred to v0.2"); // allow-println: CLI output
+            eprintln!("explain subcommand deferred to v0.2");
             Ok(())
         }
         Command::Init { .. } => {
-            eprintln!( // allow-println: CLI output
+            eprintln!(
                 "init subcommand deferred to v0.2 — copy examples/generic.toml from the repo as a starting point"
             );
             Ok(())
@@ -325,10 +325,10 @@ fn resolve_config_path(cli: &Cli, manifest: &Path) -> Result<PathBuf> {
 /// will escalate as needed.
 fn report_diagnostics(diagnostics: &[cargo_eventflow::analysis::GraphDiagnostic]) {
     for d in diagnostics {
-        eprintln!("warning: {d}"); // allow-println: CLI output
+        eprintln!("warning: {d}");
     }
     if !diagnostics.is_empty() {
-        eprintln!("({} diagnostic(s) — see above)", diagnostics.len()); // allow-println: CLI output
+        eprintln!("({} diagnostic(s) — see above)", diagnostics.len());
     }
 }
 

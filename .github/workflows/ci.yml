@@ -20,7 +20,8 @@ permissions:
 
 jobs:
   ci:
-    uses: dlepaux/github-workflows/.github/workflows/rust-crate.yml@v1.5.1
+    uses: dlepaux/github-workflows/.github/workflows/rust-crate.yml@v1.6.1
     with:
       crate_name: cargo-eventflow
       coverage_floor: 50
+      is_cli_tool: true
