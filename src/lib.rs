@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 // cargo-eventflow library surface.
 // Stub for story 00 — real implementation lands in stories 01-04.
 // See plan in https://github.com/dlepaux/cargo-eventflow (or gordon-workspace
