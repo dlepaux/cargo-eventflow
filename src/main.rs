@@ -333,15 +333,18 @@ fn report_diagnostics(diagnostics: &[cargo_eventflow::analysis::GraphDiagnostic]
 }
 
 fn write_output(path: Option<&Path>, content: &str) -> Result<()> {
-    if let Some(p) = path {
-        std::fs::write(p, content).with_context(|| format!("writing output to {}", p.display()))
-    } else {
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        handle
-            .write_all(content.as_bytes())
-            .context("writing stdout")
-    }
+    path.map_or_else(
+        || {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            handle
+                .write_all(content.as_bytes())
+                .context("writing stdout")
+        },
+        |p| {
+            std::fs::write(p, content).with_context(|| format!("writing output to {}", p.display()))
+        },
+    )
 }
 
 /// Handle cargo's "cargo-X eventflow ..." invocation pattern.

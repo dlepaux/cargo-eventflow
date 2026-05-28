@@ -54,7 +54,7 @@ pub struct Config {
     pub diagnostics: DiagnosticsConfig,
 }
 
-fn default_schema_version() -> u32 {
+const fn default_schema_version() -> u32 {
     1
 }
 
@@ -160,7 +160,7 @@ fn default_output_path() -> String {
     "docs/event-flow.md".into()
 }
 
-fn default_markdown() -> bool {
+const fn default_markdown() -> bool {
     true
 }
 
@@ -180,7 +180,7 @@ fn default_theme() -> String {
     "default".into()
 }
 
-fn default_group_by_publisher() -> bool {
+const fn default_group_by_publisher() -> bool {
     true
 }
 
@@ -205,7 +205,7 @@ impl Default for DiagnosticsConfig {
     }
 }
 
-fn default_max_warnings() -> usize {
+const fn default_max_warnings() -> usize {
     20
 }
 

@@ -264,9 +264,11 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         .build();
 
     for entry in walker {
-        let entry = entry.map_err(|err| match err.io_error() {
-            Some(io) => std::io::Error::new(io.kind(), err.to_string()),
-            None => std::io::Error::other(err.to_string()),
+        let entry = entry.map_err(|err| {
+            err.io_error().map_or_else(
+                || std::io::Error::other(err.to_string()),
+                |io| std::io::Error::new(io.kind(), err.to_string()),
+            )
         })?;
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {

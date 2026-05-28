@@ -220,7 +220,7 @@ impl SymbolIndex {
     }
 }
 
-fn symbol_span(sym: &Symbol) -> &Span {
+const fn symbol_span(sym: &Symbol) -> &Span {
     match sym {
         Symbol::Const(s) | Symbol::Function(s) => &s.span,
         Symbol::Method { body, .. } => &body.span,

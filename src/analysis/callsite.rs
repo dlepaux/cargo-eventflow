@@ -1,4 +1,6 @@
-//! Call-site extraction — walk a parsed `syn::File`, find every
+//! Call-site extraction.
+//!
+//! Walk a parsed `syn::File`, find every
 //! `publish` / `subscribe` call that matches a configured
 //! [`PublisherSpec`] / [`ConsumerSpec`], filter aggressively to
 //! avoid false positives (Gordon-shaped codebases see ~92%
@@ -48,7 +50,7 @@ pub enum PublisherKind {
     Inherent,
 }
 
-fn default_subject_arg_index() -> usize {
+const fn default_subject_arg_index() -> usize {
     0
 }
 

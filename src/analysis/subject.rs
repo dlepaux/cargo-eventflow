@@ -86,7 +86,7 @@ pub struct Scope<'a> {
 impl<'a> Scope<'a> {
     /// Build a scope with no local fn body.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         current_crate: &'a str,
         helper_crates: &'a [String],
         builder_methods: &'a [String],
@@ -375,15 +375,17 @@ fn resolve_format_macro(
     // The `,` separator may be followed by arbitrary whitespace
     // because `quote::ToTokens` stringifies with single-space
     // padding between tokens. Trim aggressively.
-    let arg_snippets = if let Some(args_str) = after_template.trim_start().strip_prefix(',') {
-        split_top_level_commas(args_str.trim())
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let arg_snippets =
+        after_template
+            .trim_start()
+            .strip_prefix(',')
+            .map_or_else(Vec::new, |args_str| {
+                split_top_level_commas(args_str.trim())
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
 
     let mut out = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
@@ -508,7 +510,7 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 fn resolve_concat_macro(tokens: &str) -> ResolveOutcome {
     // `concat!("a", ".", "b")` → "a.b". String literals only.
     let mut out = String::new();
-    let mut chars = tokens.chars().peekable();
+    let mut chars = tokens.chars();
     while let Some(c) = chars.next() {
         if c == '"' {
             for next in chars.by_ref() {
