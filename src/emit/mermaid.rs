@@ -31,7 +31,7 @@ pub struct MermaidOptions {
 /// per flag would cost ergonomics for no clarity win — accept
 /// the lint with rationale per `feedback_no_allow_attributes`'s
 /// "fix the root cause" carve-out.
-#[allow(clippy::struct_excessive_bools)]
+#[allow(clippy::struct_excessive_bools)] // allow: mermaid config flags are inherently boolean
 #[derive(Debug, Clone, Copy)]
 pub struct Flags {
     /// Cluster subjects under their publishing service via

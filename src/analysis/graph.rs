@@ -273,7 +273,7 @@ fn parse_subject_or_fallback(
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)] // allow: graph builder returns nested map of maps
 fn collect_node_sets(
     resolved: &[ResolvedSite],
     inputs: &GraphInputs,
