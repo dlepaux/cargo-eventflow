@@ -1,3 +1,9 @@
+## [1.0.1](https://github.com/dlepaux/cargo-eventflow/compare/v1.0.0...v1.0.1) (2026-05-30)
+
+### Bug Fixes
+
+* **ci:** float reusable workflow on [@v1](https://github.com/v1) (one source of truth) ([e0dbf1f](https://github.com/dlepaux/cargo-eventflow/commit/e0dbf1f47489a8902cb5fb1cb04ea6ffb62e7677))
+
 ## 1.0.0 (2026-05-28)
 
 ### Features
