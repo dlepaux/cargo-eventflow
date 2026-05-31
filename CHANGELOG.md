@@ -1,3 +1,9 @@
+## [1.1.0](https://github.com/dlepaux/cargo-eventflow/compare/v1.0.1...v1.1.0) (2026-05-31)
+
+### Features
+
+* **graph:** advisory orphan-publisher/consumer + unresolved-subject diagnostics ([f28d705](https://github.com/dlepaux/cargo-eventflow/commit/f28d705ab66f50c65ed7fb14e4f5a0f0e807307f))
+
 ## [1.0.1](https://github.com/dlepaux/cargo-eventflow/compare/v1.0.0...v1.0.1) (2026-05-30)
 
 ### Bug Fixes
