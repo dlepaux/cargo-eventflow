@@ -9,7 +9,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::model::{Edge, EdgeKind, Graph, NatsPattern, Node, ServiceId};
+use crate::model::{Edge, EdgeKind, Graph, NatsPattern, Node, Segment, ServiceId};
 
 use super::callsite::{CallKind, RawCallSite};
 use super::subject::{ResolveOutcome, Scope, UnresolvedReason};
@@ -114,6 +114,40 @@ pub enum GraphDiagnostic {
         /// The declared trigger pattern that found no overlap.
         pattern: String,
     },
+    /// A subject published in code overlaps no `Subscribe` call
+    /// site -- something fires events nobody reads. **Advisory**
+    /// (lenient `overlaps` semantics; no exit code in v0.1). Could
+    /// be a wired-up-later consumer, a typo, or a genuinely dead
+    /// publish path -- manual review needed.
+    OrphanPublisher {
+        /// Service crate the publish call lives in.
+        crate_name: String,
+        /// The published subject that found no overlapping consumer.
+        subject: String,
+    },
+    /// A subject subscribed in code overlaps no `Publish` call
+    /// site -- something reads events nobody fires. **Advisory**
+    /// (lenient `overlaps` semantics; no exit code in v0.1). Could
+    /// be an ingress-fed subject (external source publishes), a
+    /// typo, or a dead subscribe path -- manual review needed.
+    OrphanConsumer {
+        /// Service crate the subscribe call lives in.
+        crate_name: String,
+        /// The subscribed subject that found no overlapping publisher.
+        subject: String,
+    },
+    /// A dynamic / unresolvable subject (`?`) was observed in code,
+    /// so subject-level orphan detection could not evaluate it. Not
+    /// an orphan -- surfaced separately so the operator sees the
+    /// coverage gap rather than a silently-skipped subject. Resolve
+    /// the subject (e.g. via a `// eventflow:` annotation or resolver
+    /// config) to bring it under orphan analysis.
+    UnresolvedSubjectCoverage {
+        /// Service crate the unresolved call lives in.
+        crate_name: String,
+        /// Whether the unresolved call publishes or subscribes.
+        role: &'static str,
+    },
 }
 
 impl std::fmt::Display for GraphDiagnostic {
@@ -154,6 +188,24 @@ impl std::fmt::Display for GraphDiagnostic {
                 f,
                 "orphan egress {egress_name:?}: declared trigger pattern {pattern:?} has no observed publisher in code (sink declared but nothing fires)"
             ),
+            Self::OrphanPublisher {
+                crate_name,
+                subject,
+            } => write!(
+                f,
+                "orphan publisher in {crate_name}: subject {subject:?} is published but no observed consumer subscribes to an overlapping pattern (advisory)"
+            ),
+            Self::OrphanConsumer {
+                crate_name,
+                subject,
+            } => write!(
+                f,
+                "orphan consumer in {crate_name}: subject {subject:?} is subscribed but no observed publisher emits an overlapping pattern (advisory)"
+            ),
+            Self::UnresolvedSubjectCoverage { crate_name, role } => write!(
+                f,
+                "unresolved subject coverage gap in {crate_name}: a {role} subject is dynamic ('?') and could not be checked for orphan status -- resolve it to bring it under analysis"
+            ),
         }
     }
 }
@@ -174,6 +226,7 @@ pub fn build_graph(inputs: &GraphInputs, index: &SymbolIndex) -> (Graph, Vec<Gra
     let mut edges = collect_edges(&resolved, inputs);
     matches::add_matches_edges(&mut edges, &resolved, inputs);
     detect_orphan_ingress_egress(&resolved, inputs, &mut diagnostics);
+    detect_orphan_subjects(&resolved, &mut diagnostics);
     let nodes = materialise_nodes(&services, &subjects, &ingress_names, &egress_names);
     let edge_list = materialise_edges(edges, &services, &subjects, &ingress_names, &egress_names);
     (
@@ -446,6 +499,97 @@ fn detect_orphan_ingress_egress(
                     egress_name: eg.name.clone(),
                     pattern: declared.as_str().to_string(),
                 });
+            }
+        }
+    }
+}
+
+/// `true` iff the pattern is the `?` unresolved-subject sentinel
+/// (a single `Literal("?")` segment). These come from call sites the
+/// resolver gave up on; they never overlap a real subject (`?` only
+/// matches `?`), so feeding them to orphan detection would always
+/// report a false positive. Excluded from flagging, surfaced
+/// separately via `UnresolvedSubjectCoverage`.
+fn is_unresolved(pat: &NatsPattern) -> bool {
+    matches!(pat.segments(), [Segment::Literal(t)] if t == "?")
+}
+
+/// Emit `OrphanPublisher` / `OrphanConsumer` advisory diagnostics for
+/// observed code subjects with no symmetric counterpart, plus a
+/// `UnresolvedSubjectCoverage` note for dynamic `?` subjects.
+///
+/// Symmetric to [`detect_orphan_ingress_egress`] but purely
+/// code-to-code (no config involvement):
+/// - A **published** subject with no observed consumer overlapping it
+///   -> `OrphanPublisher` (events fired, nobody reads).
+/// - A **subscribed** subject with no observed publisher overlapping
+///   it -> `OrphanConsumer` (events read, nobody fires).
+///
+/// **Advisory only:** v0.1 surfaces these as diagnostics with no exit
+/// code / CI gate. Lenient `overlaps` (not `covers`) matches the
+/// ingress/egress logic; strict mode is deferred to v0.2.
+///
+/// **Ingress/egress interplay:** a publisher whose only reader is an
+/// external egress sink, or a consumer fed only by an external ingress
+/// source, may surface here -- those legitimate external counterparts
+/// are caught by [`detect_orphan_ingress_egress`] against config, not
+/// by this code-only sweep. The advisory framing accounts for that
+/// expected false-positive class until the rate is proven.
+///
+/// **Dynamic `?` subjects** are excluded from orphan flagging (they
+/// would always false-positive) and reported once per
+/// `(crate, role)` via `UnresolvedSubjectCoverage` so the coverage
+/// gap stays visible.
+fn detect_orphan_subjects(resolved: &[ResolvedSite], diagnostics: &mut Vec<GraphDiagnostic>) {
+    let observed_publishers: BTreeSet<NatsPattern> = resolved
+        .iter()
+        .filter(|s| matches!(s.kind, CallKind::Publish) && !is_unresolved(&s.subject))
+        .map(|s| s.subject.clone())
+        .collect();
+    let observed_consumers: BTreeSet<NatsPattern> = resolved
+        .iter()
+        .filter(|s| matches!(s.kind, CallKind::Subscribe) && !is_unresolved(&s.subject))
+        .map(|s| s.subject.clone())
+        .collect();
+
+    // De-dup the coverage-gap note: one per (crate, role), not one
+    // per call site, so a service with many dynamic subjects emits a
+    // single readable note.
+    let mut unresolved_seen: BTreeSet<(String, &'static str)> = BTreeSet::new();
+
+    for site in resolved {
+        if is_unresolved(&site.subject) {
+            let role = match site.kind {
+                CallKind::Publish => "publisher",
+                CallKind::Subscribe => "consumer",
+            };
+            if unresolved_seen.insert((site.crate_name.clone(), role)) {
+                diagnostics.push(GraphDiagnostic::UnresolvedSubjectCoverage {
+                    crate_name: site.crate_name.clone(),
+                    role,
+                });
+            }
+            continue;
+        }
+        match site.kind {
+            CallKind::Publish => {
+                if !observed_consumers.iter().any(|c| c.overlaps(&site.subject)) {
+                    diagnostics.push(GraphDiagnostic::OrphanPublisher {
+                        crate_name: site.crate_name.clone(),
+                        subject: site.subject.as_str().to_string(),
+                    });
+                }
+            }
+            CallKind::Subscribe => {
+                if !observed_publishers
+                    .iter()
+                    .any(|p| p.overlaps(&site.subject))
+                {
+                    diagnostics.push(GraphDiagnostic::OrphanConsumer {
+                        crate_name: site.crate_name.clone(),
+                        subject: site.subject.as_str().to_string(),
+                    });
+                }
             }
         }
     }

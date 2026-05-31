@@ -91,6 +91,21 @@ fn subscribe_site(
     )
 }
 
+/// `true` iff no *resolution* diagnostic was emitted (unresolved
+/// subject / consumer-name / malformed subject). Advisory orphan
+/// diagnostics are intentionally ignored -- they are a separate
+/// concern from "did the resolver resolve this call site cleanly?".
+fn no_resolution_diags(diags: &[GraphDiagnostic]) -> bool {
+    !diags.iter().any(|d| {
+        matches!(
+            d,
+            GraphDiagnostic::UnresolvedSubject { .. }
+                | GraphDiagnostic::UnresolvedConsumerName { .. }
+                | GraphDiagnostic::MalformedSubject { .. }
+        )
+    })
+}
+
 fn consume_label(g: &Graph) -> Option<&str> {
     g.edges
         .iter()
@@ -110,7 +125,14 @@ fn consumer_name_literal_resolves_to_self() {
         ..Default::default()
     };
     let (g, diags) = build_graph(&inputs, &SymbolIndex::new());
-    assert!(diags.is_empty(), "literal resolved cleanly");
+    // No *resolution* diagnostic: the literal resolved cleanly. (An
+    // advisory subject-orphan diagnostic is expected here -- this
+    // fixture has a lone subscribe with no publisher -- so we assert
+    // the absence of the resolution class, not blanket emptiness.)
+    assert!(
+        no_resolution_diags(&diags),
+        "literal resolved cleanly, got {diags:?}"
+    );
     assert_eq!(consume_label(&g), Some("executor-default"));
 }
 
@@ -144,7 +166,13 @@ fn consumer_name_local_binding_followed_via_fn_body() {
         ..Default::default()
     };
     let (g, diags) = build_graph(&inputs, &SymbolIndex::new());
-    assert!(diags.is_empty(), "local binding resolved");
+    // See `consumer_name_literal_resolves_to_self`: assert no
+    // resolution diagnostic, not blanket emptiness (an advisory
+    // subject-orphan is expected for this publisher-less fixture).
+    assert!(
+        no_resolution_diags(&diags),
+        "local binding resolved, got {diags:?}"
+    );
     assert_eq!(consume_label(&g), Some("executor-default"));
 }
 
@@ -535,6 +563,195 @@ fn orphan_egress_quiet_when_publisher_overlaps() {
     };
     let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
     assert!(orphan_egress_diags(&diags).is_empty());
+}
+
+// ---- P2: subject-level orphan detection (advisory) ----
+
+fn orphan_pub_diags(g_diags: &[GraphDiagnostic]) -> Vec<(&str, &str)> {
+    g_diags
+        .iter()
+        .filter_map(|d| match d {
+            GraphDiagnostic::OrphanPublisher {
+                crate_name,
+                subject,
+            } => Some((crate_name.as_str(), subject.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+fn orphan_consumer_diags(g_diags: &[GraphDiagnostic]) -> Vec<(&str, &str)> {
+    g_diags
+        .iter()
+        .filter_map(|d| match d {
+            GraphDiagnostic::OrphanConsumer {
+                crate_name,
+                subject,
+            } => Some((crate_name.as_str(), subject.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+fn unresolved_coverage_diags(g_diags: &[GraphDiagnostic]) -> Vec<(&str, &str)> {
+    g_diags
+        .iter()
+        .filter_map(|d| match d {
+            GraphDiagnostic::UnresolvedSubjectCoverage { crate_name, role } => {
+                Some((crate_name.as_str(), *role))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn orphan_publisher_flagged_when_no_consumer_overlaps() {
+    // `svc` publishes `foo.bar`; nothing subscribes anywhere ->
+    // orphan publisher (events fired, nobody reads).
+    let inputs = GraphInputs {
+        call_sites: vec![pub_site("svc", "foo.bar")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert_eq!(orphan_pub_diags(&diags), vec![("svc", "foo.bar")]);
+    assert!(orphan_consumer_diags(&diags).is_empty());
+}
+
+#[test]
+fn orphan_consumer_flagged_when_no_publisher_overlaps() {
+    // `svc` subscribes `foo.bar`; nothing publishes anywhere ->
+    // orphan consumer (events read, nobody fires).
+    let inputs = GraphInputs {
+        call_sites: vec![sub_site("svc", "foo.bar")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert_eq!(orphan_consumer_diags(&diags), vec![("svc", "foo.bar")]);
+    assert!(orphan_pub_diags(&diags).is_empty());
+}
+
+#[test]
+fn paired_subject_emits_no_subject_orphan() {
+    // Publisher `foo.bar` + consumer `foo.bar` -> exact pair, no
+    // orphan on either side.
+    let inputs = GraphInputs {
+        call_sites: vec![pub_site("a", "foo.bar"), sub_site("b", "foo.bar")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert!(orphan_pub_diags(&diags).is_empty());
+    assert!(orphan_consumer_diags(&diags).is_empty());
+}
+
+#[test]
+fn paired_subject_via_wildcard_overlap_emits_no_orphan() {
+    // Publisher `foo.bar`, consumer `foo.*` -> overlap (lenient
+    // `overlaps` semantics) -> neither side orphan.
+    let inputs = GraphInputs {
+        call_sites: vec![pub_site("a", "foo.bar"), sub_site("b", "foo.*")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert!(orphan_pub_diags(&diags).is_empty());
+    assert!(orphan_consumer_diags(&diags).is_empty());
+}
+
+#[test]
+fn star_cross_overlap_pairs_both_sides() {
+    // Publisher `foo.bar.*`, consumer `foo.*.baz`: neither covers
+    // the other but both accept `foo.bar.baz` -> overlap -> no
+    // orphan on either side (matches ingress/egress lenient rule).
+    let inputs = GraphInputs {
+        call_sites: vec![pub_site("a", "foo.bar.*"), sub_site("b", "foo.*.baz")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert!(orphan_pub_diags(&diags).is_empty());
+    assert!(orphan_consumer_diags(&diags).is_empty());
+}
+
+#[test]
+fn non_overlapping_pub_and_sub_both_orphan() {
+    // Publisher `foo.bar` and consumer `baz.qux` share no concrete
+    // subject -> both are orphans (one in each direction).
+    let inputs = GraphInputs {
+        call_sites: vec![pub_site("a", "foo.bar"), sub_site("b", "baz.qux")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert_eq!(orphan_pub_diags(&diags), vec![("a", "foo.bar")]);
+    assert_eq!(orphan_consumer_diags(&diags), vec![("b", "baz.qux")]);
+}
+
+#[test]
+fn dynamic_publisher_subject_not_flagged_orphan_but_noted() {
+    // `runtime_subject` is unresolvable -> renders as `?`. It must
+    // NOT be flagged orphan (it would always false-positive); it
+    // must surface as an unresolved-coverage note instead.
+    let inputs = GraphInputs {
+        call_sites: vec![site("svc", CallKind::Publish, "runtime_subject")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert!(
+        orphan_pub_diags(&diags).is_empty(),
+        "dynamic `?` publisher must not be flagged orphan, got {diags:?}"
+    );
+    assert_eq!(
+        unresolved_coverage_diags(&diags),
+        vec![("svc", "publisher")]
+    );
+}
+
+#[test]
+fn dynamic_consumer_subject_not_flagged_orphan_but_noted() {
+    // Symmetric to the publisher case for a subscribe call site.
+    let inputs = GraphInputs {
+        call_sites: vec![site("svc", CallKind::Subscribe, "runtime_subject")],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert!(
+        orphan_consumer_diags(&diags).is_empty(),
+        "dynamic `?` consumer must not be flagged orphan, got {diags:?}"
+    );
+    assert_eq!(unresolved_coverage_diags(&diags), vec![("svc", "consumer")]);
+}
+
+#[test]
+fn dynamic_subject_excluded_from_counterpart_overlap_set() {
+    // A dynamic `?` publisher must not be treated as a valid
+    // counterpart for a real consumer: the consumer `foo.bar` still
+    // has no *resolved* publisher overlapping it, so it stays an
+    // orphan consumer. (Guards against `?` silently "satisfying"
+    // a real subject.)
+    let inputs = GraphInputs {
+        call_sites: vec![
+            site("p", CallKind::Publish, "runtime_subject"),
+            sub_site("c", "foo.bar"),
+        ],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert_eq!(orphan_consumer_diags(&diags), vec![("c", "foo.bar")]);
+    assert_eq!(unresolved_coverage_diags(&diags), vec![("p", "publisher")]);
+}
+
+#[test]
+fn dynamic_subjects_coverage_note_deduped_per_crate_role() {
+    // Two dynamic publishers in the same crate -> a single
+    // coverage note, not one per call site.
+    let inputs = GraphInputs {
+        call_sites: vec![
+            site("svc", CallKind::Publish, "runtime_a"),
+            site("svc", CallKind::Publish, "runtime_b"),
+        ],
+        ..Default::default()
+    };
+    let (_, diags) = build_graph(&inputs, &SymbolIndex::new());
+    assert_eq!(
+        unresolved_coverage_diags(&diags),
+        vec![("svc", "publisher")]
+    );
 }
 
 #[test]
