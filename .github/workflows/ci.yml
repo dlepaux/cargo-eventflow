@@ -25,3 +25,5 @@ jobs:
       crate_name: cargo-eventflow
       coverage_floor: 50
       is_cli_tool: true
+    secrets:
+      KELLNR_TOKEN: ${{ secrets.KELLNR_TOKEN }}
